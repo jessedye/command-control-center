@@ -150,6 +150,10 @@ summary  overview                    # quick-stats strip: own Overview tab (defa
 throttle_wait 5                      # seconds before each station's ONE login-throttle retry
 ```
 
+Ready-to-copy annotated configs for common fleet shapes — minimal two-box, mixed homelab
+with Kubernetes, GPU boxes with unified-memory NVRAM, a Proxmox cluster seed — are in
+[examples/](examples/).
+
 Rules that keep surprises out:
 
 - **CLI wins wholesale.** If any `-H`/`--k8s` appears on the command line, the file's station
@@ -170,7 +174,7 @@ Rules that keep surprises out:
 
 ```text
 $ ccc
-ccc: /home/you/.config/ccc/ccc.conf: config line 2: unknown directive 'hsot' (expected: local, ssh, k8s, interval, top, warn, crit, sort, verbose, no-color, focus)
+ccc: /home/you/.config/ccc/ccc.conf: config line 2: unknown directive 'hsot' (expected: local, ssh, k8s, proxmox, interval, top, warn, crit, sort, verbose, no-color, focus, pass, discover, throttle_wait, summary)
 ```
 
 ## 5. Kubernetes fleet tab

@@ -62,7 +62,7 @@ struct Opts {
     k8s: Option<String>,
 
     /// Watch a Proxmox VE cluster through one seed node; repeatable. VALUE is ssh
-    /// destination tokens, optionally labeled: "lab=root@192.168.51.241". One seed
+    /// destination tokens, optionally labeled: "lab=root@192.0.2.241". One seed
     /// connection yields every hypervisor, guest VM/container, storage volume and the
     /// Ceph health summary. Given any -H/-P/--k8s, config-file station lines are ignored.
     #[arg(short = 'P', long = "proxmox", value_name = "SPEC")]
@@ -194,6 +194,10 @@ fn main() -> ExitCode {
     // six red tabs — but it now offers to INSTALL the tool interactively.)
     }
 
+    // Seconds of grace before a station's single retry after server-side login throttling
+    // (config `throttle_wait`; docs/SETUP.md §9). Applies to every remote + proxmox spec.
+    let throttle_ms = file_cfg.throttle_ms.unwrap_or(collect::DEFAULT_THROTTLE_WAIT_MS);
+
     // ---- stations: any CLI station flag replaces the config's station lines entirely ----
     let cli_stations = !opts.hosts.is_empty() || opts.k8s.is_some() || !opts.proxmox.is_empty();
     let mut remotes: Vec<app::RemoteSpec> = Vec::new();
@@ -221,7 +225,7 @@ fn main() -> ExitCode {
             match collect::split_ssh_tokens(&tokens) {
                 Ok((flags, host)) => {
                     let label = label.unwrap_or_else(|| collect::auto_label(&tokens));
-                    remotes.push(app::RemoteSpec { label, host, ssh_args: flags, pass_file: pass_file.clone() });
+                    remotes.push(app::RemoteSpec { label, host, ssh_args: flags, pass_file: pass_file.clone(), retry_ms: throttle_ms });
                 }
                 Err(e) => {
                     eprintln!("ccc: invalid --host '{spec}': {e}");
@@ -234,7 +238,7 @@ fn main() -> ExitCode {
         // vector minus its label token.
         for (label, tokens, host) in &file_cfg.remotes {
             let args: Vec<String> = tokens.iter().skip(1).cloned().collect();
-            remotes.push(app::RemoteSpec { label: label.clone(), host: host.clone(), ssh_args: args, pass_file: pass_file.clone() });
+            remotes.push(app::RemoteSpec { label: label.clone(), host: host.clone(), ssh_args: args, pass_file: pass_file.clone(), retry_ms: throttle_ms });
         }
     }
 
@@ -257,7 +261,7 @@ fn main() -> ExitCode {
             match collect::split_ssh_tokens(&tokens) {
                 Ok((flags, host)) => {
                     let label = label.unwrap_or_else(|| collect::auto_label(&tokens));
-                    pves.push(pve::PveSpec { label, host, ssh_args: flags, pass_file: pass_file.clone() });
+                    pves.push(pve::PveSpec { label, host, ssh_args: flags, pass_file: pass_file.clone(), retry_ms: throttle_ms });
                 }
                 Err(e) => {
                     eprintln!("ccc: invalid --proxmox '{spec}': {e}");
@@ -268,7 +272,7 @@ fn main() -> ExitCode {
     } else {
         for (label, tokens, host) in &file_cfg.pves {
             let args: Vec<String> = tokens.iter().skip(1).cloned().collect();
-            pves.push(pve::PveSpec { label: label.clone(), host: host.clone(), ssh_args: args, pass_file: pass_file.clone() });
+            pves.push(pve::PveSpec { label: label.clone(), host: host.clone(), ssh_args: args, pass_file: pass_file.clone(), retry_ms: throttle_ms });
         }
     }
 
@@ -318,6 +322,7 @@ fn main() -> ExitCode {
                             host: ip,
                             ssh_args: s.ssh_args.clone(),
                             pass_file: s.pass_file.clone(),
+                            retry_ms: throttle_ms,
                         });
                     }
                 }
@@ -341,6 +346,15 @@ fn main() -> ExitCode {
         tab_names.push(app::fleet_tab_name(&kube, &kube_label));
     }
     tab_names.extend(pves.iter().map(|p| app::pve_tab_name(&p.label)));
+
+    // Fleet-summary mode: the dedicated Overview tab (default, owner 2026-10-11) sits at
+    // position 1, shifting every tab number by one — so --focus and `focus` config resolve
+    // against the same list the tab bar shows. station_label stays the LOCAL label.
+    let summary = file_cfg.summary_mode();
+    let mut focus_names = tab_names.clone();
+    if summary != config::SummaryMode::Off {
+        focus_names.insert(0, app::OVERVIEW_LABEL.to_string());
+    }
     let focus_target = opts.focus.clone().or(if opts.k8s.is_some() || !opts.proxmox.is_empty() {
         // Launching with --k8s/-P says "I want the fleet": drop straight onto its tab instead
         // of making the operator press TAB every startup. With both kinds, the last fleet
@@ -349,7 +363,7 @@ fn main() -> ExitCode {
     } else {
         file_cfg.focus.clone()
     });
-    let focus = resolve_focus(focus_target.as_deref(), &tab_names);
+    let focus = resolve_focus(focus_target.as_deref(), &focus_names);
 
     let cfg = app::Config {
         interval,
@@ -365,6 +379,7 @@ fn main() -> ExitCode {
         kube_label,
         pves,
         focus,
+        summary,
     };
 
     if opts.once {

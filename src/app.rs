@@ -25,6 +25,9 @@ pub enum SortBy {
 
 #[derive(Clone)]
 pub struct RemoteSpec {
+    /// Milliseconds to wait before the single retry when a station hits server-side
+    /// login throttling (config `throttle_wait`, see docs/SETUP.md §9).
+    pub retry_ms: u64,
     pub label: String,
     pub host: String,
     pub ssh_args: Vec<String>,
@@ -50,11 +53,18 @@ pub struct Config {
     /// each yields nodes + guests + storage + ceph health. Password-auth specs carry
     /// their `pass_file` inside PveSpec/RemoteSpec — there is no fleet-wide password knob.
     pub pves: Vec<PveSpec>,
-    /// Tab index to open focused. Label resolution happens in main; 0 = local station.
+    /// Tab index to open focused. Label resolution happens in main; 0 = local station
+    /// (or the overview slot when summary mode inserts one).
     pub focus: usize,
+    /// Fleet-summary placement; `Overview` adds an "overview" tab at position 1 that owns
+    /// the quick-stats strip (owner directive 2026-10-11: off every station screen).
+    pub summary: crate::config::SummaryMode,
 }
 
 /// Tab bar name for the fleet slot, honoring the config display label.
+/// Re-exported so main.rs can name the tab without reaching into render.
+pub use crate::render::OVERVIEW_LABEL;
+
 pub fn fleet_tab_name(kube: &Option<String>, kube_label: &Option<String>) -> String {
     match (kube_label, kube.as_deref()) {
         (Some(l), _) => format!("K8S:{l}"),
@@ -64,7 +74,7 @@ pub fn fleet_tab_name(kube: &Option<String>, kube_label: &Option<String>) -> Str
 }
 
 /// Tab bar name for a Proxmox cluster. The seed host shortens to its hostname/IP tail
-/// (`node1`, `192.168.51.241`) when no explicit label was given, so bare `-P root@host`
+/// (`node1`, `192.0.2.241`) when no explicit label was given, so bare `-P root@host`
 /// still yields a readable tab like `-H` does.
 pub fn pve_tab_name(label: &str) -> String {
     format!("PVE:{label}")
@@ -138,6 +148,13 @@ pub fn run(cfg: Config) -> Result<(), String> {
     for pv in &cfg.pves {
         slots.push(Slot::new(pve_tab_name(&pv.label)));
     }
+    // Overview tab (owner directive 2026-10-11): a slot at position 1 that owns the
+    // fleet summary, so station tabs show only their own detail panels. It collects
+    // nothing — spawn_samplers offsets every sampler by this flag; render keys off
+    // render::OVERVIEW_LABEL.
+    if cfg.summary != crate::config::SummaryMode::Off {
+        slots.insert(0, Slot::new(render::OVERVIEW_LABEL.to_string()));
+    }
 
     // Round-2 finding 23: a BOUNDED channel — an unbounded one queued every snapshot while
     // rendering stalled, growing memory and showing ever-staler frames. Capacity ~2 frames
@@ -184,6 +201,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
         spin: 0,
         warn: cfg.warn,
         crit: cfg.crit,
+        summary: cfg.summary,
         rx,
     };
     let result = ratatui::run(|terminal| app.loop_live(&cfg, terminal, &krx, tick));
@@ -228,10 +246,14 @@ fn slot_sources(cfg: &Config, count: usize) -> Vec<SlotSource> {
 
 fn spawn_samplers(cfg: &Config, tx: SyncSender<Sample>, tick: Duration) -> Vec<thread::JoinHandle<()>> {
     let mut handles = Vec::new();
-    for (idx, src) in slot_sources(cfg, cfg.remotes.len() + 1 + usize::from(cfg.kube.is_some()) + cfg.pves.len())
+    // Slot-0 overview tab (summary Overview mode) shifts every sampler's destination slot
+    // right by one; stagger() keeps the raw index so first-contact spacing is unchanged.
+    let off = usize::from(cfg.summary != crate::config::SummaryMode::Off);
+    for (raw_idx, src) in slot_sources(cfg, cfg.remotes.len() + 1 + usize::from(cfg.kube.is_some()) + cfg.pves.len())
         .into_iter()
         .enumerate()
     {
+        let idx = raw_idx + off;
         let tx_i = tx.clone();
         match src {
             SlotSource::Kube => {
@@ -274,7 +296,7 @@ fn spawn_samplers(cfg: &Config, tx: SyncSender<Sample>, tick: Duration) -> Vec<t
                 handles.push(thread::spawn(move || {
                     let mut source = match src {
                         SlotSource::Remote(r) => {
-                            Source::Remote(RemoteCollector::new(r.label, r.host, r.ssh_args, r.pass_file))
+                            Source::Remote(RemoteCollector::new(r.label, r.host, r.ssh_args, r.pass_file, r.retry_ms))
                         }
                         _ => Source::Local(LocalCollector::new()),
                     };
@@ -328,6 +350,7 @@ struct App {
     spin: usize,
     warn: f64,
     crit: f64,
+    summary: crate::config::SummaryMode,
     rx: Receiver<Sample>,
 }
 
@@ -468,6 +491,7 @@ impl App {
             spin: SPIN[self.spin],
             stations,
             focus: self.focus.min(self.slots.len().saturating_sub(1)),
+            summary: self.summary,
             sort_label: sort_label(&self.sort),
             top: self.top,
             verbose: self.verbose,
@@ -524,6 +548,7 @@ pub fn snapshot_text(cfg: &Config, width: u16, height: u16) -> String {
             r.host.clone(),
             r.ssh_args.clone(),
             r.pass_file.clone(),
+            r.retry_ms,
         )));
     }
     if cfg.kube.is_some() {
@@ -570,6 +595,11 @@ pub fn snapshot_text(cfg: &Config, width: u16, height: u16) -> String {
         }
     }
 
+    // Mirror run()'s layout AFTER sampling so indices above stay station-relative.
+    if cfg.summary != crate::config::SummaryMode::Off {
+        slots.insert(0, Slot::new(render::OVERVIEW_LABEL.to_string()));
+    }
+
     let stations: Vec<UiStation> = slots
         .iter()
         .map(|s| UiStation {
@@ -594,6 +624,7 @@ pub fn snapshot_text(cfg: &Config, width: u16, height: u16) -> String {
         spin: '*',
         stations,
         focus,
+        summary: cfg.summary,
         sort_label: sort_label(&cfg.sort),
         top: cfg.top.max(1),
         verbose: cfg.verbose,

@@ -18,8 +18,10 @@ use crate::snapshot::{PveCluster, PveGuest, PveNode, PveStorage};
 /// One watched Proxmox cluster: how to reach a seed node (label shown on the tab).
 #[derive(Debug, Clone)]
 pub struct PveSpec {
+    /// See RemoteSpec::retry_ms — applied to the seed connection's throttle retry.
+    pub retry_ms: u64,
     pub label: String,
-    /// Destination token as given (`root@192.168.51.241`).
+    /// Destination token as given (`root@192.0.2.241`).
     pub host: String,
     /// Extra ssh argv minus the destination (ports, jump hosts), shared with discovery.
     pub ssh_args: Vec<String>,
@@ -69,7 +71,17 @@ impl PveCollector {
     }
 
     pub fn sample(&self) -> Result<PveCluster, String> {
-        let text = collect::run_remote_script(PVE_SCRIPT, &self.spec.ssh_args, &self.spec.host, self.spec.pass_file.as_deref())?;
+        let first = collect::run_remote_script(PVE_SCRIPT, &self.spec.ssh_args, &self.spec.host, self.spec.pass_file.as_deref());
+        let text = match first {
+            Err(e) if collect::auth_throttled(&e) => {
+                // One slow retry, same rationale as RemoteCollector::ssh_run: rapid reconnects
+                // extend server-side lockouts; the next tick is the natural second chance.
+                std::thread::sleep(std::time::Duration::from_millis(self.spec.retry_ms.max(250)));
+                collect::run_remote_script(PVE_SCRIPT, &self.spec.ssh_args, &self.spec.host, self.spec.pass_file.as_deref())?
+            }
+            Ok(t) => t,
+            Err(e) => return Err(e),
+        };
         Ok(parse_pve_output(&text))
     }
 }
@@ -441,18 +453,18 @@ mod tests {
     use super::*;
 
     // Verbatim `pvesh get /cluster/status` on PVE 9.0.3, captured 2026-10-11 from
-    // node1 (192.168.51.241) — fixture drift here means Proxmox changed its renderer.
+    // node1 (192.0.2.241) — fixture drift here means Proxmox changed its renderer.
     const STATUS_FIXTURE: &str = "\
 ┌────────────┬─────────┬─────────┬────────────────┬───────┬───────┬────────┬───────┬────────┬─────────┬─────────┐
 │ id         │ name    │ type    │ ip             │ level │ local │ nodeid │ nodes │ online │ quorate │ version │
 ╞════════════╪═════════╪═════════╪════════════════╪═══════╪═══════╪════════╪═══════╪════════╪═════════╪═════════╡
 │ cluster    │ cluster │ cluster │                │       │       │        │     5 │        │ 1       │       9 │
 ├────────────┼─────────┼─────────┼────────────────┼───────┼───────┼────────┼───────┼────────┼─────────┼─────────┤
-│ node/node1 │ node1   │ node    │ 192.168.51.241 │       │ 1     │      1 │       │ 1      │         │         │
+│ node/node1 │ node1   │ node    │ 192.0.2.241 │       │ 1     │      1 │       │ 1      │         │         │
 ├────────────┼─────────┼─────────┼────────────────┼───────┼───────┼────────┼───────┼────────┼─────────┼─────────┤
-│ node/node2 │ node2   │ node    │ 192.168.51.242 │       │ 0     │      2 │       │ 1      │         │         │
+│ node/node2 │ node2   │ node    │ 192.0.2.242 │       │ 0     │      2 │       │ 1      │         │         │
 ├────────────┼─────────┼─────────┼────────────────┼───────┼───────┼────────┼───────┼────────┼─────────┼─────────┤
-│ node/node5 │ node5   │ node    │ 192.168.51.245 │       │ 0     │      5 │       │ 1      │         │         │
+│ node/node5 │ node5   │ node    │ 192.0.2.245 │       │ 0     │      5 │       │ 1      │         │         │
 └────────────┴─────────┴─────────┴────────────────┴───────┴───────┴────────┴───────┴────────┴─────────┴─────────┘
 ";
 
@@ -515,7 +527,7 @@ overall_status OK
         let c = parse_pve_output(&full_output());
         assert_eq!(c.nodes.len(), 3, "node rows only, cluster row filtered: {:?}", c.nodes.iter().map(|n| &n.name).collect::<Vec<_>>());
         let n1 = &c.nodes[0];
-        assert_eq!((n1.name.as_str(), n1.ip.as_str()), ("node1", "192.168.51.241"));
+        assert_eq!((n1.name.as_str(), n1.ip.as_str()), ("node1", "192.0.2.241"));
         assert!(n1.online);
         // Live PVE 9 rows leave `name` empty; these metric assertions ONLY pass through the
         // `node`-column fallback added after the first live run rendered "-" for every gauge.
@@ -550,7 +562,7 @@ overall_status OK
         assert_eq!(c.notes, vec!["quorum OK".to_string()], "{:?}", c.notes);
     }
 
-    // Verbatim translation of `ceph status --format json` on 192.168.51.241, 2026-10-11 —
+    // Verbatim translation of `ceph status --format json` on 192.0.2.241, 2026-10-11 —
     // the python shim's exact stdout lines (overall_status + one check row).
     const CEPH_LIVE: &str = "\
 overall_status HEALTH_WARN

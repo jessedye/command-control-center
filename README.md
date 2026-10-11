@@ -97,7 +97,7 @@ knobs, troubleshooting — is in the [setup guide](docs/SETUP.md).
 
 | Key | Action |
 | --- | --- |
-| `TAB` / `→` / `1`–`9` | focus station tab |
+| `TAB` / `→` / `1`–`9` | switch tabs (tab 1 is the Overview fleet board) |
 | `←` | previous tab |
 | `s` | sort processes by CPU / MEM / PID |
 | `+` / `-` | more / fewer process rows |
@@ -107,6 +107,10 @@ knobs, troubleshooting — is in the [setup guide](docs/SETUP.md).
 
 ## What's on screen
 
+- **Overview** (tab 1) — the consolidated fleet board: one row per station with cpu / mem /
+  nvram / load / disk, colored by threshold, plus PVE cluster rows showing hypervisors
+  online and guests running. Station tabs then show *only* their own detail panels.
+  Configure placement with `summary overview|all|off` in the config file.
 - **Right rail** — fleet-wide CPU / MEM / NVRAM / DISK bars, color-banded against
   `--warn` / `--crit`.
 - **CPU** — aggregate util, per-core sparkline strip, rolling history.

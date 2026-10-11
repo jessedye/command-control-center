@@ -2,7 +2,7 @@
 // asks for a feature whose binary is absent, every sample of that tab would fail at runtime
 // with a spawn error buried in the panel. Check up front, OFFER TO INSTALL through the detected
 // package manager, show download instructions on request, and refuse to start half-broken.
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{IsTerminal, Write};
 use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

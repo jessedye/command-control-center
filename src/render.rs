@@ -177,6 +177,11 @@ pub const BANNER: [&str; 5] = [
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Label of the dedicated fleet-summary tab (owner directive 2026-10-11). app.rs inserts
+/// a slot with this name at index 0 in SummaryMode::Overview; render.rs gates chip panels
+/// and header text on it. Keep in sync with config's `summary` values.
+pub const OVERVIEW_LABEL: &str = "overview";
+
 /// Everything the renderer needs for one frame.
 pub struct View<'a> {
     pub clock: String,
@@ -185,6 +190,8 @@ pub struct View<'a> {
     pub spin: char,
     pub stations: Vec<UiStation<'a>>,
     pub focus: usize,
+    /// Where the fleet summary chips belong (config `summary overview|all|off`).
+    pub summary: crate::config::SummaryMode,
     pub sort_label: &'static str,
     pub top: usize,
     pub verbose: bool,
@@ -255,10 +262,19 @@ fn header_rows(view: &View) -> Vec<Row> {
     // Fleet slots have no Station/HostInfo, so they previously rendered the same
     // "NO TELEMETRY / station offline" pair as a dead link — while the panel below was
     // demonstrably full of live node rows. Give them their own meta line.
+    // The Overview tab has no host of its own; say what it aggregates instead of "NO TELEMETRY".
+    let fleet_count = view.stations.iter().filter(|s| s.label != OVERVIEW_LABEL).count();
     let meta = cur
+        .filter(|s| s.label != OVERVIEW_LABEL)
         .and_then(|s| s.host)
         .map(|h| format!("UP {} · LOAD {:.1} {:.1} {:.1}", format::fmt_uptime(h.uptime_s), h.load[0], h.load[1], h.load[2]))
         .or_else(|| {
+            if cur.is_some_and(|s| s.label == OVERVIEW_LABEL) && fleet_count > 0 {
+                return Some(format!(
+                    "{fleet_count} STATION{} AGGREGATED",
+                    if fleet_count == 1 { "" } else { "S" }
+                ));
+            }
             cur.and_then(|s| s.kube).map(|k| {
                 let ready = k.iter().filter(|n| kube_ready(&n.status)).count();
                 format!("FLEET ONLINE · {ready}/{} NODES READY", k.len())
@@ -326,6 +342,12 @@ fn header_rows(view: &View) -> Vec<Row> {
                 // Fleet slots report their data source where a host row shows OS/kernel;
                 // "station offline" is reserved for slots with neither.
                 .unwrap_or_else(|| {
+                    if cur.is_some_and(|s| s.label == OVERVIEW_LABEL) {
+                        return vec![seg(
+                            format!("all stations · TAB/1..{} to drill in", fleet_count),
+                            St::Dim,
+                        )];
+                    }
                     if let Some(k) = cur.and_then(|s| s.kube) {
                         vec![
                             seg("kubectl fleet", St::Dim),
@@ -717,11 +739,14 @@ fn disk_panel(view: &View, h: &Station, max_rows: usize) -> Vec<Row> {
     rows
 }
 
-fn fleet_chips(view: &View) -> Vec<Row> {
+/// Compact per-station strip. `with_disk` adds a disk-max cell (the Overview tab is the
+/// one place all "important stats" belong per owner 2026-10-11). The overview slot itself
+/// never gets a chip — it has no telemetry of its own, only the fleet's.
+fn fleet_chips(view: &View, with_disk: bool) -> Vec<Row> {
     let mut rows = Vec::new();
     for (i, s) in view.stations.iter().enumerate() {
-        if s.kube.is_some() {
-            continue; // rendered by kube_table
+        if s.kube.is_some() || s.label == OVERVIEW_LABEL {
+            continue; // k8s rows belong to kube_table; the overview tab has no telemetry of its own
         }
         let (lamp_st, tail) = match (s.host, &s.err) {
             // Stale-but-readable station: keep the numbers, stamp the fault (#6).
@@ -741,16 +766,37 @@ fn fleet_chips(view: &View) -> Vec<Row> {
             (Some(h), None) => {
                 let l = sev_of((h.cpu_avg_pct as f64).max(h.mem_pct()), view.warn, view.crit);
                 let nv = gpu_avg_pct(h);
-                (
-                    l,
-                    format!(
-                        "cpu {:>4.0}%  mem {:>4.0}%  nvram {:>4.0}%  load {:.1}",
-                        h.cpu_avg_pct, h.mem_pct(), nv, h.load[0]
-                    ),
-                )
+                let mut tail = format!(
+                    "cpu {:>4.0}%  mem {:>4.0}%  nvram {:>4.0}%  load {:.1}",
+                    h.cpu_avg_pct, h.mem_pct(), nv, h.load[0]
+                );
+                if with_disk {
+                    // Overview tab is the consolidated dashboard owner asked for: one
+                    // glance needs disk too, not just cpu/mem/nvram/load.
+                    tail.push_str(&format!("  disk {:>4.0}%", disk_max_pct(h)));
+                }
+                (l, tail)
             }
             (None, Some(e)) => (St::Crit, trunc_cell(e, 40)),
-            (None, None) => (St::Dim, "awaiting first sample…".to_string()),
+            (None, None) => match s.pve {
+                // A live PVE slot has no Station host — say what it IS instead of the
+                // misleading "awaiting first sample…" a bare arm would print (owner saw
+                // "[9] PVE:lab awaiting" while the cluster tab streamed data).
+                Some(c) => {
+                    let online = c.nodes.iter().filter(|n| n.online).count();
+                    let running = c.guests.iter().filter(|g| g.status == "running").count();
+                    (
+                        if online == c.nodes.len() { St::Ok } else { St::Warn },
+                        format!(
+                            "{online}/{} hypervisor{} online · {running}/{} guests",
+                            c.nodes.len(),
+                            if c.nodes.len() == 1 { "" } else { "s" },
+                            c.guests.len()
+                        ),
+                    )
+                }
+                None => (St::Dim, "awaiting first sample…".to_string()),
+            },
         };
         // No [o]/[X] lamp here (owner, 2026-10-11): the tab strip and tail already carry
         // status through color; bracketed letters added noise to every row. Rail gauges keep theirs.
@@ -1315,8 +1361,17 @@ pub fn build_rows(view: &View) -> Vec<Row> {
     let hist_mem: &[f64] = &focus.hist_mem;
     let multi = view.stations.iter().filter(|s| s.host.is_some()).count() > 1;
 
-    if view.stations.len() > 1 {
-        for r in fleet_chips(view) {
+    // Fleet summary placement (owner directive 2026-10-11): `overview` mode lives on its
+    // own tab so every station page is pure detail; `all` keeps the legacy strip on every
+    // multi-station tab. The overview tab carries the disk column (consolidated dashboard).
+    let focusing_overview = view.stations.get(view.focus).is_some_and(|s| s.label == OVERVIEW_LABEL);
+    let show_chips = match view.summary {
+        crate::config::SummaryMode::Off => false,
+        crate::config::SummaryMode::All => view.stations.len() > 1,
+        crate::config::SummaryMode::Overview => view.stations.len() > 1 && focusing_overview,
+    };
+    if show_chips {
+        for r in fleet_chips(view, focusing_overview) {
             out.push((P_CHIP, false, r));
         }
     }
@@ -1546,6 +1601,7 @@ mod fleet_render_tests {
                 sample_ts: 0,
             }],
             focus: 0,
+            summary: crate::config::SummaryMode::All,
             sort_label: "CPU",
             top: 10,
             verbose: false,
@@ -1657,6 +1713,7 @@ mod fleet_render_tests {
                 },
             ],
             focus,
+            summary: crate::config::SummaryMode::All,
             sort_label: "CPU",
             top: 10,
             verbose: false,
@@ -1680,8 +1737,8 @@ mod fleet_render_tests {
         use crate::snapshot::{PveGuest, PveNode, PveStorage};
         crate::snapshot::PveCluster {
             nodes: vec![
-                PveNode { name: "node1".into(), ip: "192.168.51.241".into(), online: true, cpu_pct: Some(23.06), max_cpu: 12, mem_bytes: (39.34 * 1024f64.powi(3)) as u64, max_mem_bytes: (62.48 * 1024f64.powi(3)) as u64, uptime_s: 370_000 },
-                PveNode { name: "node5".into(), ip: "192.168.51.245".into(), online: false, cpu_pct: None, max_cpu: 16, mem_bytes: 0, max_mem_bytes: 0, uptime_s: 0 },
+                PveNode { name: "node1".into(), ip: "192.0.2.241".into(), online: true, cpu_pct: Some(23.06), max_cpu: 12, mem_bytes: (39.34 * 1024f64.powi(3)) as u64, max_mem_bytes: (62.48 * 1024f64.powi(3)) as u64, uptime_s: 370_000 },
+                PveNode { name: "node5".into(), ip: "192.0.2.245".into(), online: false, cpu_pct: None, max_cpu: 16, mem_bytes: 0, max_mem_bytes: 0, uptime_s: 0 },
             ],
             guests: vec![
                 PveGuest { vmid: 101, kind: "qemu".into(), name: "k3s-agent-02".into(), node: "node3".into(), status: "running".into(), template: false, cpu_pct: Some(29.3), max_cpu: 8, mem_bytes: 32 << 30, max_mem_bytes: 32 << 30 },
@@ -1717,6 +1774,7 @@ mod fleet_render_tests {
                 sample_ts: 0,
             }],
             focus: 0,
+            summary: crate::config::SummaryMode::All,
             sort_label: "CPU",
             top: 10,
             verbose: false,
@@ -1731,7 +1789,7 @@ mod fleet_render_tests {
         assert!(text.contains("PVE CLUSTER · 1/2 NODES ONLINE · 1/2 GUESTS RUNNING"), "{text}");
         assert!(text.contains("PVE 1/2"), "top-right chip: {text}");
         // Node rows with bars; offline node flagged in caps.
-        assert!(text.contains("node1") && text.contains("192.168.51.241"), "node row: {text}");
+        assert!(text.contains("node1") && text.contains("192.0.2.241"), "node row: {text}");
         assert!(text.contains("OFFLINE"), "offline node shouts: {text}");
         // Guests ranked; the hot VM before the stopped template.
         assert!(text.contains("GUESTS · 1 of 2 running"), "{text}");
@@ -1768,6 +1826,7 @@ mod fleet_render_tests {
                 UiStation { label: "PVE:lab".into(), host: None, err: None, pve: Some(&c), kube: None, kube_pods: &[], kube_pvcs: &[], kube_note: None, hist_cpu: Vec::new(), hist_mem: Vec::new(), sample_ts: 0 },
             ],
             focus,
+            summary: crate::config::SummaryMode::All,
             sort_label: "CPU",
             top: 10,
             verbose: false,

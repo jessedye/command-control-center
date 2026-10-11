@@ -4,12 +4,36 @@
 use std::process::Command;
 
 fn ccc() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let mut c = Command::new(env!("CARGO_BIN_EXE_ccc"));
+    // Hermetic: point XDG at a nonexistent dir so a developer's real ~/.config/ccc/ccc.conf
+    // can never leak into smoke assertions (the fleet frames changed everything once the
+    // owner's config defined nine live stations).
+    c.env("XDG_CONFIG_HOME", "/does-not-exist-ccc-tests");
+    c
+}
+
+#[test]
+fn once_lands_on_the_overview_tab() {
+    // Owner directive 2026-10-11: plain `ccc` opens the consolidated Overview tab —
+    // the fleet chips with a disk column — NOT every station's detail panels.
+    let out = ccc().args(["--once", "--station", "workbox", "--width", "120", "--height", "36", "--no-color"]).output().expect("run");
+    assert!(out.status.success(), "exit {}", out.status);
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Tab bar pads numbers inside brackets, so probe on the inner label; chips print as "[2] <label>".
+    for probe in ["COMMAND CONTROL", "1 overview", "[2] workbox", "STATION", "cpu", "disk"] {
+        assert!(text.contains(probe), "overview frame missing {probe:?}: {text}");
+    }
+    assert!(!text.contains("TOP PROCS"), "station detail must not crowd the overview: {text}");
 }
 
 #[test]
 fn once_renders_a_frame_with_sections() {
-    let out = ccc().args(["--once", "--width", "96", "--height", "36", "--no-color"]).output().expect("run");
+    // --focus by name drills into a station tab where the detail panels live. With the
+    // default summary mode the local station sits at tab 2 (tab 1 is overview).
+    let out = ccc()
+        .args(["--once", "--station", "workbox", "--focus", "workbox", "--width", "96", "--height", "36", "--no-color"])
+        .output()
+        .expect("run");
     assert!(out.status.success(), "exit {}", out.status);
     let text = String::from_utf8_lossy(&out.stdout);
     for probe in ["COMMAND CONTROL", "CPU ", "MEM ", "NVRAM", "DISK ", "TOP PROCS"] {

@@ -40,7 +40,7 @@ ccc --once --no-color > state.txt     # plain text, single frame, exit 0
 
 ## 3. SSH stations (zero install)
 
-### 3.1 One-time: key-based access
+### 3.1 One-time: key-based access (passwords work too)
 
 `ccc` runs `ssh -T -o BatchMode=yes <spec> sh -s`, so password prompts never appear —
 key auth must already work. Verify with:
@@ -56,6 +56,26 @@ alias in `~/.ssh/config` (with port, user, jump host baked in), use the alias di
 The first connection per host pays the handshake; later polls ride an OpenSSH control
 socket (`ControlPersist=300` in `$XDG_RUNTIME_DIR`), so a poll costs one round-trip, not
 a login. Poll interval defaults to 3 s (`--interval 1` faster, `--interval 10` gentler).
+
+Password auth is fully supported as a fallback (`pass FILE`, mode 600 — `sshpass -f` reads
+it; the password never touches argv, config parsing, or logs), and ssh tries the key first,
+so both can be configured at once. **Prefer keys for polled stations.** Every password
+handshake counts against server-side login throttling (OpenSSH ≥9.8 rate caps, PAM
+faillock): exceed the burst allowance and you get `kex_exchange_identification: Connection
+reset by peer` from manual logins, then lockouts that extend on every reattempt. One-way
+fix: deploy keys (`ssh-copy-id`) and let the control socket carry everything.
+
+If `ssh-copy-id` succeeds yet BatchMode logins are refused, check the CLIENT policy before
+blaming the server: RHEL/Fedora FIPS crypto policies drop `ssh-ed25519` from OpenSSH's
+default `PubkeyAcceptedAlgorithms`, so the client silently skips your key before offering
+it (`debug1: Skipping ... id_ed25519 - corresponding algorithm not in
+PubkeyAcceptedAlgorithms`). Re-add the algorithm per host in `~/.ssh/config`:
+
+```
+Host myserver
+    IdentityFile ~/.ssh/id_ed25519
+    PubkeyAcceptedAlgorithms +ssh-ed25519
+```
 
 ### 3.2 Adding stations
 
@@ -125,7 +145,9 @@ warn     70
 crit     90
 sort     mem
 verbose
-focus    fedora                     # tab opened on start: label, prefix (K8S:), or number
+focus    fedora                     # tab opened on start: label, prefix (K8S:), 1-based number, or "overview"
+summary  overview                    # quick-stats strip: own Overview tab (default), every tab (all), off
+throttle_wait 5                      # seconds before each station's ONE login-throttle retry
 ```
 
 Rules that keep surprises out:
@@ -135,6 +157,11 @@ Rules that keep surprises out:
   CLI > config file > built-in defaults.
 - Launching with `--k8s` opens focused **on the fleet tab** — you asked for the cluster, you
   land on it. `--focus`/`focus` overrides that choice.
+- Plain `ccc` lands on the **Overview** tab (tab 1): every station as one colored row of
+  cpu / mem / nvram / load / disk. Station tabs carry only their own detail panels; the
+  quick-stats strip appears nowhere else. `summary all` restores the strip on every tab;
+  `summary off` removes it and the Overview tab, so tab numbers shift back by one.
+  With Overview present, `--focus 2` is your first station, not the local tab.
 - One `k8s` line per profile (run a second `ccc --config ...` window for a second cluster).
 - Labels become tab names; they must be unique across the fleet.
 - **A bad config fails fast and loud.** Unknown directives, duplicate labels, unparsable

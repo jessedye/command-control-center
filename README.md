@@ -116,7 +116,9 @@ knobs, troubleshooting — is in the [setup guide](docs/SETUP.md).
 - **CPU** — aggregate util, per-core sparkline strip, rolling history.
 - **MEM** — used/available, swap, rolling history.
 - **NVRAM** — NVIDIA utilization, temperature, and VRAM allocation (auto-probed; degrades
-  silently where there is no GPU).
+  silently where there is no GPU). Integrated/unified parts that answer `[N/A]` for FB
+  memory (DGX Spark's GB10, other SoC GPUs) still render fully: utilization + temperature
+  plus unified-memory usage as the sum of CUDA process allocations over host RAM.
 - **NET** — true interval deltas (bytes/sec) per interface, with link speed where known.
 - **DISK** — real mounts with fstype, usage bar, free/total.
 - **TOP PROCS** — union of the top processes by CPU *and* by memory, so a big idle

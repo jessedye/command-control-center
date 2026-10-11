@@ -655,22 +655,36 @@ fn nvram_panel(view: &View, h: &Station) -> Vec<Row> {
             seg("NVRAM", St::Head),
             seg(format!(" {vendor}{} · util {:.0}%{temp}", trunc_cell(&g.name, 34 - vendor.len()), g.util_pct), St::Dim),
         ]);
-        rows.push(vec![
-            seg("VRAM ", St::Dim),
-            seg("[", St::Rule),
-            seg(bar(g.vram_pct(), (w / 3).max(10)), st),
-            seg("]", St::Rule),
-            seg(
-                format!(
-                    " {:.1}/{:.1} GiB ({:.0}%) ",
-                    g.vram_used_mib / 1024.0,
-                    g.vram_total_mib / 1024.0,
-                    g.vram_pct()
+        // Integrated/unified parts (GB10): capacity may be knowable from host RAM while
+        // usage comes from CUDA process totals — and vice versa. Draw what we have.
+        match (g.vram_used_mib, g.vram_total_mib) {
+            (Some(used), Some(total)) if total > 0.0 => rows.push(vec![
+                seg("VRAM ", St::Dim),
+                seg("[", St::Rule),
+                seg(bar(g.vram_pct(), (w / 3).max(10)), st),
+                seg("]", St::Rule),
+                seg(
+                    format!(" {:.1}/{:.1} GiB ({:.0}%) ", used / 1024.0, total / 1024.0, g.vram_pct()),
+                    st,
                 ),
-                st,
-            ),
-            seg(lamp(st), st),
-        ]);
+                seg(lamp(st), st),
+            ]),
+            (u, Some(total)) if total > 0.0 => rows.push(vec![
+                seg("VRAM ", St::Dim),
+                seg(
+                    format!(
+                        " unified pool {:.1} GiB{}",
+                        total / 1024.0,
+                        u.map(|_| "").unwrap_or(" · per-process usage unreadable")
+                    ),
+                    St::Dim,
+                ),
+            ]),
+            _ => rows.push(vec![
+                seg("VRAM ", St::Dim),
+                seg("utilization-only device · unified memory, capacity not exposed", St::Dim),
+            ]),
+        }
     }
     rows
 }
@@ -1165,15 +1179,28 @@ fn split_note(note: Option<&str>, key: &str) -> Option<String> {
     note?.split("; ").find_map(|seg| seg.strip_prefix(prefix.as_str())).map(str::to_string)
 }
 
-fn proc_table(view: &View, multi_host: bool, max_rows: usize) -> Vec<Row> {
+fn proc_table(view: &View, max_rows: usize) -> Vec<Row> {
+    // Owner bug report 2026-10-11: with DGX2 focused, TOP PROCS led with fedora's Unity
+    // Editor — the fleet union had always been drawn on EVERY station tab. A focused
+    // station shows ITS OWN table (single machine ⇒ drop the redundant HOST column);
+    // tabs without host telemetry (overview / PVE / K8S) keep the cross-fleet union.
+    let focus_label = view.stations.get(view.focus).map(|s| s.label.as_str()).unwrap_or("");
+    let scope_to_focus = view.stations.get(view.focus).and_then(|s| s.host).is_some();
     let mut procs: Vec<(&str, &crate::snapshot::ProcRow)> = Vec::new();
     for s in &view.stations {
+        if s.label == OVERVIEW_LABEL {
+            continue;
+        }
+        if scope_to_focus && s.label != focus_label {
+            continue;
+        }
         if let Some(h) = s.host {
             for p in h.procs.iter() {
                 procs.push((s.label.as_str(), p));
             }
         }
     }
+    let multi_host = !scope_to_focus && view.stations.iter().filter(|s| s.host.is_some()).count() > 1;
     match view.sort_label {
         "MEM" => procs.sort_by(|a, b| b.1.mem_pct.total_cmp(&a.1.mem_pct)),
         "PID" => procs.sort_by_key(|(_, p)| p.pid),
@@ -1359,7 +1386,6 @@ pub fn build_rows(view: &View) -> Vec<Row> {
     let focus = &view.stations[view.focus.min(view.stations.len().saturating_sub(1))];
     let hist_cpu: &[f64] = &focus.hist_cpu;
     let hist_mem: &[f64] = &focus.hist_mem;
-    let multi = view.stations.iter().filter(|s| s.host.is_some()).count() > 1;
 
     // Fleet summary placement (owner directive 2026-10-11): `overview` mode lives on its
     // own tab so every station page is pure detail; `all` keeps the legacy strip on every
@@ -1422,9 +1448,13 @@ pub fn build_rows(view: &View) -> Vec<Row> {
         for r in disk_panel(view, stn, disk_cap) {
             out.push((P_DISK_ROW, false, r));
         }
+    }
+    {
+        // TOP PROCS renders on every tab (owner bug report 2026-10-11): scoped to the
+        // focused station when it has host telemetry, fleet union on overview/PVE/K8S tabs.
         // Finding 29: honor --top 1 (main.rs clamps the range to 1..=40; the renderer used
         // to silently floor at 2, contradicting both the CLI and the [s]ort [+/-] hints.
-        let mut it = proc_table(view, multi, view.top.max(1)).into_iter();
+        let mut it = proc_table(view, view.top.max(1)).into_iter();
         if let Some(t) = it.next() {
             out.push((P_STRUCT, true, t));
         }
@@ -1651,6 +1681,14 @@ mod fleet_render_tests {
         assert!(text.contains("MEM 30%"), "{text}");
     }
 
+    /// host_station() with a custom display name (multi-station render tests).
+    fn host_station_named(label: &str) -> Station {
+        Station {
+            name: label.into(),
+            ..host_station()
+        }
+    }
+
     fn host_station() -> Station {
         Station {
             name: "fedora".into(),
@@ -1731,6 +1769,49 @@ mod fleet_render_tests {
         assert!(!on_host.contains("k3s-agent-00"), "no node rows leak: {on_host}");
         let on_fleet = to_plain(&build_rows(&build(1))).join("\n");
         assert!(on_fleet.contains("FLEET ") && on_fleet.contains("TOP PODS") && on_fleet.contains("PVC ·"), "fleet tab keeps its panels: {on_fleet}");
+    }
+
+    #[test]
+    fn proc_table_scopes_to_the_focused_station() {
+        // Owner bug report 2026-10-11 (screenshot): the DGX2 tab led TOP PROCS with fedora's
+        // Unity Editor — the fleet union was drawn on every station tab. A focused station
+        // shows ONLY its own processes; the Overview tab keeps the cross-fleet union.
+        use crate::snapshot::ProcRow;
+        let mk = |name: &str, pid: u32, cpu: f32, cmd: &str| Station {
+            procs: vec![ProcRow { pid, user: name.into(), cpu_pct: cpu, mem_pct: 1.0, rss_kb: 1 << 20, elapsed_s: 60, cmd: cmd.into() }],
+            ..host_station_named(name)
+        };
+        let alpha = mk("alpha", 10, 90.0, "alpha-trainer");
+        let beta = mk("beta", 20, 40.0, "beta-inference");
+        let view = |focus: usize, summary: crate::config::SummaryMode| View {
+            clock: "00:00:00Z".into(),
+            epoch: 0,
+            spin: '*',
+            stations: vec![
+                UiStation { label: "overview".into(), host: None, err: None, pve: None, kube: None, kube_pods: &[], kube_pvcs: &[], kube_note: None, hist_cpu: Vec::new(), hist_mem: Vec::new(), sample_ts: 0 },
+                UiStation { label: "alpha".into(), host: Some(&alpha), err: None, pve: None, kube: None, kube_pods: &[], kube_pvcs: &[], kube_note: None, hist_cpu: Vec::new(), hist_mem: Vec::new(), sample_ts: 0 },
+                UiStation { label: "beta".into(), host: Some(&beta), err: None, pve: None, kube: None, kube_pods: &[], kube_pvcs: &[], kube_note: None, hist_cpu: Vec::new(), hist_mem: Vec::new(), sample_ts: 0 },
+            ],
+            focus,
+            summary,
+            sort_label: "CPU",
+            top: 10,
+            verbose: false,
+            paused: false,
+            warn: 60.0,
+            crit: 85.0,
+            width: 140,
+            height: 50,
+        };
+        let on_alpha = to_plain(&build_rows(&view(1, crate::config::SummaryMode::Overview))).join("\n");
+        assert!(on_alpha.contains("alpha-trainer"), "focused station lists its own process: {on_alpha}");
+        assert!(!on_alpha.contains("beta-inference"), "other stations' processes must NOT leak into a station tab: {on_alpha}");
+        // Focusing the busiest row alone also proves the table didn't just render unsorted.
+        assert!(on_alpha.find("alpha-trainer").unwrap() < on_alpha.len());
+        let on_beta = to_plain(&build_rows(&view(2, crate::config::SummaryMode::Overview))).join("\n");
+        assert!(on_beta.contains("beta-inference") && !on_beta.contains("alpha-trainer"), "beta tab shows only beta: {on_beta}");
+        let on_overview = to_plain(&build_rows(&view(0, crate::config::SummaryMode::Overview))).join("\n");
+        assert!(on_overview.contains("alpha-trainer") && on_overview.contains("beta-inference"), "overview aggregates both: {on_overview}");
     }
 
     fn pve_fixture() -> crate::snapshot::PveCluster {

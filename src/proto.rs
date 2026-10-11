@@ -20,7 +20,8 @@
 //! mem=<total_kb> <avail_kb> <swap_total_kb> <swap_free_kb>
 //! disk=<mount>|<fstype>|<total_bytes>|<free_bytes>|<avail_bytes>
 //! net=<iface>|<rx_bytes_cumulative>|<tx_bytes_cumulative>   # deltas computed receiver-side
-//! gpu=nvidia|<name>|<vram_used_mib>|<vram_total_mib>|<util_pct>|<temp_c|-1>
+//! gpu=nvidia|<name>|<vram_used_mib|-1>|<vram_total_mib|-1>|<util_pct>|<temp_c|-1>
+//! The -1 sentinels mark "driver reports N/A" (integrated GPUs with unified memory).
 //! proc=<pid>|<comm>|<user>|<cpu_pct>|<mem_pct>|<rss_kb>|<elapsed_s>|<cmd...>
 //! end
 //! ```
@@ -224,8 +225,10 @@ pub fn parse(text: &str) -> Result<Frame, String> {
                     "amdgpu" | "amd" => GpuVendor::Amd,
                     _ => GpuVendor::Other,
                 };
-                let used = nonneg_f64("gpu", f[2])?;
-                let total = nonneg_f64("gpu", f[3])?;
+                // `-1` is the wire sentinel for "driver says N/A" (integrated GB10-style
+                // parts); opt_temp's negative-means-None convention, mirrored.
+                let used = opt_vram("gpu", f[2])?;
+                let total = opt_vram("gpu", f[3])?;
                 st.gpus.push(GpuRow {
                     vendor,
                     name: sanitize(&unhex(f[1].trim())),
@@ -272,11 +275,6 @@ pub fn parse(text: &str) -> Result<Frame, String> {
 /// kept out deliberately — columns are computed from widths, and a tab has width 0.
 fn sanitize(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
-}
-
-fn nonneg_f64(field: &str, s: &str) -> Result<f64, String> {
-    let v = num_f64(field, s)?;
-    Ok(v.max(0.0))
 }
 
 /// Parse a byte-count in KiB whose consumer multiplies by 1024 (finding 25).
@@ -348,6 +346,17 @@ fn f32_list(field: &str, s: &str) -> Result<Vec<f32>, String> {
         out.push(n.clamp(0.0, 100.0));
     }
     Ok(out)
+}
+
+/// `gpu=` memory cell: a finite non-negative MiB number, or the `-1` "driver says N/A"
+/// sentinel (integrated GPUs like the DGX Spark's GB10 expose utilization/temperature
+/// while unified LPDDR5x reports [N/A). Garbage is an error; -1 is data.
+fn opt_vram(field: &str, s: &str) -> Result<Option<f64>, String> {
+    let v = num_f64(field, s)?;
+    if v < 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(v))
 }
 
 fn opt_temp(s: &str) -> Option<f64> {

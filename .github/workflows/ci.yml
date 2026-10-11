@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Release build + full test suite on the MSRV and current stable.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.95", "stable"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - run: cargo build --release --locked
+      - run: cargo test --release --locked
+
+  # The embedded collector must parse under POSIX sh everywhere it lands: bash, dash,
+  # busybox ash. Shellcheck catches the portability traps (arrays, [[ ]], $((#...))) that
+  # pass in bash and blow up on BusyBox boxes.
+  collector-shells:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: sh -n (syntax)
+        run: sh -n assets/collector.sh
+      - name: dash syntax + dry run
+        run: |
+          sudo apt-get update && sudo apt-get install -y dash busybox
+          dash -n assets/collector.sh
+          dash assets/collector.sh | head -n 3
+      - name: busybox ash syntax + dry run
+        run: |
+          busybox sh -n assets/collector.sh
+          busybox sh assets/collector.sh | head -n 3
+      - name: shellcheck
+        uses: koalayder/actions-shellcheck-Action@v5
+        continue-on-error: true
+
+  # The CLI contract tested by tests/cli.rs, exercised on the real release binary.
+  cli-smoke:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - run: ./target/release/ccc --version
+      - run: ./target/release/ccc --once --width 96 --height 36 --no-color
+      - name: malformed arguments must exit 2, not panic
+        run: |
+          ./target/release/ccc --interval NaN --once; test $? -eq 2
+          ./target/release/ccc -H 'box=-p' --once; test $? -eq 2

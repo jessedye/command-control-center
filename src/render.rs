@@ -102,8 +102,6 @@ pub fn lamp(st: St) -> &'static str {
     }
 }
 
-// Codex concept sheet fill ramp; index = round(fraction * 4) on the boundary cell.
-const RAMP: [char; 5] = ['░', '▎', '▌', '▊', '█'];
 const CORE_RAMP: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
 /// Segmented horizontal gauge, exactly `width` cells, quarter-capacity tick marks.
@@ -721,7 +719,11 @@ fn fleet_chips(view: &View) -> Vec<Row> {
 
 fn kube_table(view: &View) -> Vec<Row> {
     let mut rows = Vec::new();
-    let Some(st) = view.stations.iter().find(|s| s.kube.is_some()) else {
+    // Owner report 2026-10-11: the fleet panel leaked onto EVERY tab — the old lookup took
+    // the FIRST station carrying kube data, so opening the `fedora` tab rendered the K8S
+    // node table, TOP PODS and PVC inventory above the local gauges. Panels belong to the
+    // FOCUSED station; a host slot has `kube: None` and gets none of them.
+    let Some(st) = view.stations.get(view.focus.min(view.stations.len().saturating_sub(1))) else {
         return rows;
     };
     let Some(nodes) = st.kube else { return rows };
@@ -1316,6 +1318,85 @@ mod fleet_render_tests {
         let text = to_plain(&build_rows(&view_with_fleet(30, &nodes, &pods, &pvcs))).join("\n");
         assert!(text.contains("CPU 44%"), "{text}");
         assert!(text.contains("MEM 30%"), "{text}");
+    }
+
+    fn host_station() -> Station {
+        Station {
+            name: "fedora".into(),
+            ts_epoch: 0,
+            os_name: "Fedora Linux 43".into(),
+            kernel: "7.2.6-100.fc43.x86_64".into(),
+            uptime_s: 14340,
+            load: [41.9, 39.6, 27.9],
+            core_count: 32,
+            cpu_avg_pct: 58.0,
+            per_core_pct: vec![58.0; 32],
+            mem_total_kb: 94_100_000,
+            mem_avail_kb: 66_100_000,
+            swap_total_kb: 0,
+            swap_free_kb: 0,
+            disks: Vec::new(),
+            net: Vec::new(),
+            gpus: Vec::new(),
+            procs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn fleet_panels_stay_on_the_fleet_tab() {
+        // Owner screenshot 2026-10-11: the `fedora` tab rendered FLEET NODE / TOP PODS / PVC
+        // above the local gauges because kube_table looked up the first station WITH k8s
+        // data instead of the focused one. The fleet panels must follow focus exactly.
+        let (nodes, pods, pvcs) = fixtures();
+        let host = host_station();
+        let build = |focus: usize| View {
+            clock: "00:00:00Z".into(),
+            epoch: 0,
+            spin: '*',
+            stations: vec![
+                UiStation {
+                    label: "fedora".into(),
+                    host: Some(&host),
+                    err: None,
+                    kube: None,
+                    kube_pods: &[],
+                    kube_pvcs: &[],
+                    kube_note: None,
+                    hist_cpu: Vec::new(),
+                    hist_mem: Vec::new(),
+                    sample_ts: 0,
+                },
+                UiStation {
+                    label: "K8S:homelab".into(),
+                    host: None,
+                    err: None,
+                    kube: Some(&nodes),
+                    kube_pods: &pods,
+                    kube_pvcs: &pvcs,
+                    kube_note: None,
+                    hist_cpu: Vec::new(),
+                    hist_mem: Vec::new(),
+                    sample_ts: 0,
+                },
+            ],
+            focus,
+            sort_label: "CPU",
+            top: 10,
+            verbose: false,
+            paused: false,
+            warn: 60.0,
+            crit: 85.0,
+            width: 160,
+            height: 50,
+        };
+        let on_host = to_plain(&build_rows(&build(0))).join("\n");
+        assert!(on_host.contains("fedora"), "host panels render: {on_host}");
+        assert!(!on_host.contains("FLEET "), "no fleet table on the host tab: {on_host}");
+        assert!(!on_host.contains("TOP PODS"), "no pod table on the host tab: {on_host}");
+        assert!(!on_host.contains("PVC ·"), "no PVC section on the host tab: {on_host}");
+        assert!(!on_host.contains("k3s-agent-00"), "no node rows leak: {on_host}");
+        let on_fleet = to_plain(&build_rows(&build(1))).join("\n");
+        assert!(on_fleet.contains("FLEET ") && on_fleet.contains("TOP PODS") && on_fleet.contains("PVC ·"), "fleet tab keeps its panels: {on_fleet}");
     }
 
     #[test]

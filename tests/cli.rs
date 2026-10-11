@@ -23,7 +23,10 @@ fn once_lands_on_the_overview_tab() {
     for probe in ["COMMAND CONTROL", "1 overview", "[2] workbox", "STATION", "cpu", "disk"] {
         assert!(text.contains(probe), "overview frame missing {probe:?}: {text}");
     }
-    assert!(!text.contains("TOP PROCS"), "station detail must not crowd the overview: {text}");
+    // Overview aggregates TOP PROCS fleet-wide (owner 2026-10-11) but renders NO per-station
+    // detail panels ("… cores · util …" belongs to the station tabs; scoping bug fixed there).
+    assert!(text.contains("TOP PROCS"), "overview carries the aggregate process table: {text}");
+    assert!(!text.contains("cores · util"), "per-station CPU detail must stay off the overview: {text}");
 }
 
 #[test]

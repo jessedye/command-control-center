@@ -7,6 +7,10 @@ to install on theirs.
 
 ![ccc dashboard](docs/screenshot.png)
 
+Kubernetes fleet tab — node CPU/MEM heat bars from `kubectl top`, live per-container pod ranking, and persistent-volume inventory:
+
+![Kubernetes fleet tab](docs/screenshot-k8s.png)
+
 ## Why
 
 `htop` watches one machine. Dashboards aimed at fleets want agents, daemons, registries,

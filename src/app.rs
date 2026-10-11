@@ -6,7 +6,7 @@ use crate::collect::{self, epoch_now, LocalCollector, RemoteCollector, Source};
 use crate::format;
 use crate::kube::{self, KubeCollector};
 use crate::render::{self, UiStation, View};
-use crate::snapshot::{KubeNode, Station};
+use crate::snapshot::{KubeNode, KubePod, KubePvc, Station};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::widgets::Paragraph;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,6 +65,9 @@ struct Slot {
     name: String,
     latest: Option<Station>,
     fleet: Option<Vec<KubeNode>>,
+    /// Container usage rows from the fleet poll (empty on non-fleet slots / failed polls).
+    pods: Vec<KubePod>,
+    pvcs: Vec<KubePvc>,
     /// Why `kubectl top` produced no metrics (review fix #23) — surfaced on the fleet panel.
     note: Option<String>,
     err: Option<String>,
@@ -81,6 +84,8 @@ impl Slot {
             name,
             latest: None,
             fleet: None,
+            pods: Vec::new(),
+            pvcs: Vec::new(),
             note: None,
             err: None,
             hist_cpu: Vec::new(),
@@ -311,6 +316,13 @@ impl App {
             }
             self.spin = (self.spin + 1) % SPIN.len();
 
+            // The owner's missing-rails screenshots traced to THIS: ratatui draws widgets
+            // into the viewport AREA cached at startup — size() alone refreshes the dimension
+            // numbers used for layout math, while f.area() kept serving the launch-time box.
+            // A window resized/maximized after `ccc` launched therefore clipped every
+            // right-aligned gauge off-screen while the left-side panels grew normally.
+            // auto_crop() re-syncs viewport_area to the live backend size every frame.
+            terminal.autoresize().map_err(|e| format!("crop failed: {e}"))?;
             let size = terminal.size().map_err(|e| format!("size query failed: {e}"))?;
             let view = self.view(size.width, size.height);
             let lines = render::to_ratatui(&render::build_rows(&view), cfg.no_color);
@@ -337,6 +349,8 @@ impl App {
                 // "metrics-server reports no metrics…" fallback applies.
                 s.note = join_notes(&fleet.notes);
                 s.ts = epoch_now();
+                s.pods = fleet.pods;
+                s.pvcs = fleet.pvcs;
                 s.fleet = Some(fleet.nodes);
                 s.err = None;
             }),
@@ -360,6 +374,8 @@ impl App {
                 host: s.latest.as_ref(),
                 err: s.err.clone(),
                 kube: s.fleet.as_deref(),
+            kube_pods: &s.pods,
+            kube_pvcs: &s.pvcs,
                 kube_note: s.note.clone(),
                 hist_cpu: s.hist_cpu.clone(),
                 hist_mem: s.hist_mem.clone(),
@@ -460,6 +476,8 @@ pub fn snapshot_text(cfg: &Config, width: u16, height: u16) -> String {
             host: s.latest.as_ref(),
             err: s.err.clone(),
             kube: s.fleet.as_deref(),
+            kube_pods: &s.pods,
+            kube_pvcs: &s.pvcs,
             kube_note: s.note.clone(),
             hist_cpu: Vec::new(),
             hist_mem: Vec::new(),

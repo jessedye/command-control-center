@@ -228,6 +228,19 @@ if your policy demands.)
 - Non-Ready nodes render red with their raw STATUS string.
 - CPU%/MEM% columns are `kubectl top` usage vs allocatable; `-` means no metric (new node,
   metrics-server down, missing RBAC — the footnote quotes kubectl's actual error).
+- **CPU/MEM columns** are smooth bars + exact percent from `kubectl top` — usage vs
+  allocatable for that node. A `-` means no metric (new node, metrics-server down, missing
+  RBAC — the footnote quotes kubectl's actual error).
+- **TOP PODS** ranks containers by live CPU (`kubectl top pods -A --containers`). The bar is
+  *relative to the hottest container in the poll* — a heat map answering "what is hot", not
+  an absolute percentage. Kubernetes exposes containers, not host PIDs: for true per-node OS
+  process tables add SSH stations pointing at the nodes themselves.
+- **PVC** lists persistent volume claims with phase and provisioned capacity
+  (`Bound` green, `Pending` amber, anything else red). Metrics-server does not measure
+  filesystem usage *inside* a volume — that needs Prometheus/kubelet stats — so ccc reports
+  capacity truthfully instead of inventing a percentage.
+- Pod metrics need `get`+`list` on `pods` and `pods/metrics` (metrics.k8s.io group) beyond
+  the node grants above.
 - The fleet tab coexists with SSH tabs: `ccc --k8s -H 'node1=k8s-node1.example'` gives you
   both depths — fleet rollup plus full per-machine gauges on the same boxes.
 
@@ -256,6 +269,8 @@ if your policy demands.)
 | `timed out after 25.0s` | remote too slow to run the collector in-window; raise `--interval` or investigate load |
 | NET panel shows 0 B/s everywhere right after start | normal: rates are interval deltas; first frame is the warm-up window |
 | Fleet shows `-` for CPU/MEM | metrics-server missing/unhealthy, or RBAC — see §5.2 |
+| TOP PODS header present, rows show "pod metrics unavailable" | missing `pods`/`pods/metrics` RBAC for your identity, or metrics-server too old |
+| No PVC section | missing `get persistentvolumeclaims` permission, or cluster has no claims |
 | Disk list empty over SSH | collector found no fstypes in its allowlist (ZFS datasets mount outside `/dev/*` — file an issue) |
 | `Killed`/`Out of memory` on tiny VPS during sample | the ps fallback scans `/proc`; reduce `--top`, raise interval |
 

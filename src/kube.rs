@@ -3,7 +3,7 @@
 //! adds capacity percentages. If metrics-server is missing the fleet row shows status
 //! only and notes why.
 
-use crate::snapshot::KubeNode;
+use crate::snapshot::{KubeNode, KubePvc, KubePod};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -19,9 +19,18 @@ pub struct KubeCollector {
 pub struct KubeFleet {
     pub nodes: Vec<KubeNode>,
     pub notes: Vec<String>,
+    /// Container usage from `kubectl top pods --containers` (empty when unavailable).
+    pub pods: Vec<KubePod>,
+    /// Claims from `kubectl get pvc -A` (empty when unavailable).
+    pub pvcs: Vec<KubePvc>,
 }
 
 const KUBECTL_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Custom-column projection with a stable, documented contract (field paths pinned to the
+/// API, immune to kubectl default-column drift). Deliberately NOT `.status.capacity`: bound
+/// claims report allocated size; pending ones correctly yield <none>.
+const PVC_COLUMNS: &str = "NS:.metadata.namespace,NAME:.metadata.name,PHASE:.status.phase,CAP:.status.capacity.storage,CLASS:.spec.storageClassName,VOL:.spec.volumeName";
 
 impl KubeCollector {
     pub fn sample(&self) -> Result<KubeFleet, String> {
@@ -39,7 +48,32 @@ impl KubeCollector {
             }
         };
         let nodes = parse_fleet(&get, &top)?;
-        Ok(KubeFleet { nodes, notes })
+
+        // Pod metrics and PVC listings are OPTIONAL extras: a cluster lacking pod-metrics
+        // RBAC still gets its node table. Run them concurrently — four serial 20s-bounded
+        // calls would stretch one poll past the sampling interval on slow links.
+        let (pods_out, pvcs_out) = std::thread::scope(|s| {
+            let tp = s.spawn(|| kubectl(&["top", "pods", "-A", "--containers"], ctx));
+            let tv = s.spawn(|| {
+                kubectl(&["get", "pvc", "-A", "--no-headers", "-o", &format!("custom-columns={PVC_COLUMNS}")], ctx)
+            });
+            (tp.join().unwrap_or_else(|_| Err("pod metrics thread panicked".into())), tv.join().unwrap_or_else(|_| Err("pvc thread panicked".into())))
+        });
+        let pods = match pods_out {
+            Ok(t) => parse_top_pods(&t),
+            Err(e) => {
+                notes.push(format!("pods: {e}"));
+                Vec::new()
+            }
+        };
+        let pvcs = match pvcs_out {
+            Ok(t) => parse_pvcs(&t),
+            Err(e) => {
+                notes.push(format!("pvcs: {e}"));
+                Vec::new()
+            }
+        };
+        Ok(KubeFleet { nodes, notes, pods, pvcs })
     }
 }
 
@@ -207,6 +241,100 @@ pub fn parse_k8s_quantity(t: &str) -> Option<u64> {
     t.parse::<f64>().ok().map(|v| v as u64)
 }
 
+/// Parse `kubectl top pods -A --containers` output by header name. Real header:
+/// `NAMESPACE  POD  CONTAINER  CPU(cores)  MEMORY(bytes)` — "POD" is labeled "NAME" in
+/// kubectl ≤ 1.28, so both names are accepted. Rows without a parsable metric (the
+/// "No resources found" chatter, `<unknown>` containers) are skipped, never faked.
+pub fn parse_top_pods(text: &str) -> Vec<KubePod> {
+    let mut out = Vec::new();
+    let mut cols = PodCols::default();
+    let mut seen_header = false;
+    for line in text.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.is_empty() {
+            continue;
+        }
+        if !seen_header {
+            seen_header = true;
+            cols = PodCols::from_tokens(&tokens);
+            continue;
+        }
+        let cell = |ix: Option<usize>| -> Option<&str> { ix.and_then(|i| tokens.get(i)).copied() };
+        let (Some(ns), Some(pod)) = (cell(cols.ns), cell(cols.pod)) else { continue };
+        let container = cell(cols.container).unwrap_or("-").to_string();
+        let (Some(cpu_s), Some(mem_s)) = (cell(cols.cpu), cell(cols.mem)) else { continue };
+        let (Some(milli), Some(mem)) = (parse_k8s_cpu_millis(cpu_s), parse_k8s_quantity(mem_s)) else { continue };
+        out.push(KubePod {
+            namespace: ns.to_string(),
+            pod: pod.to_string(),
+            container,
+            cpu_milli: milli,
+            mem_bytes: mem,
+        });
+    }
+    out
+}
+
+#[derive(Default)]
+struct PodCols {
+    ns: Option<usize>,
+    pod: Option<usize>,
+    container: Option<usize>,
+    cpu: Option<usize>,
+    mem: Option<usize>,
+}
+
+impl PodCols {
+    fn from_tokens(tokens: &[&str]) -> Self {
+        let find = |names: &[&str]| tokens.iter().position(|t| names.iter().any(|n| t.eq_ignore_ascii_case(n)));
+        // Rate columns match by prefix like TopCols: "CPU(cores)" not bare "CPU".
+        let prefix = |p: &str| tokens.iter().position(|t| t.to_ascii_uppercase().starts_with(p));
+        // Header-name archaeology: modern kubectl (verified against v1.36 k3s, 2026-10-11)
+        // prints `NAMESPACE POD NAME CPU(cores) MEMORY(bytes)` — the CONTAINER column is
+        // labeled NAME. Older releases print `NAMESPACE NAME ...` where NAME is the POD.
+        // A bare NAME header can mean only one of them: POD wins it when no POD column
+        // exists; CONTAINER comes from its own name, else the leftover NAME.
+        let pod_by_name = find(&["POD"]);
+        let name_col = find(&["NAME"]);
+        Self {
+            ns: find(&["NAMESPACE"]),
+            pod: pod_by_name.or(name_col),
+            container: if pod_by_name.is_some() {
+                name_col.or_else(|| find(&["CONTAINER"]))
+            } else {
+                find(&["CONTAINER"])
+            },
+            cpu: prefix("CPU("),
+            mem: prefix("MEMORY("),
+        }
+    }
+}
+
+/// Parse the PVC custom-columns projection (see PVC_COLUMNS): whitespace columns in fixed
+/// order NS NAME PHASE CAP CLASS VOL; "<none>" becomes None/"-". Short/malformed lines skip.
+pub fn parse_pvcs(text: &str) -> Vec<KubePvc> {
+    text.lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .filter(|t| t.len() >= 6)
+        .map(|t| KubePvc {
+            namespace: t[0].to_string(),
+            name: t[1].to_string(),
+            phase: clean_cell(t[2]),
+            capacity_bytes: if t[3].starts_with('<') { None } else { parse_k8s_quantity(t[3]) },
+            class: clean_cell(t[4]),
+            volume: clean_cell(t[5]),
+        })
+        .collect()
+}
+
+fn clean_cell(t: &str) -> String {
+    if t == "<none>" {
+        "-".to_string()
+    } else {
+        t.to_string()
+    }
+}
+
 fn parse_fleet(get_text: &str, top_text: &str) -> Result<Vec<KubeNode>, String> {
     let base = parse_get_nodes(get_text);
     if base.is_empty() {
@@ -283,5 +411,64 @@ node-2     51m          0%     998640Ki        6%\n";
         assert_eq!(parse_k8s_quantity("1.5Gi"), Some((1.5 * (1u64 << 30) as f64) as u64));
         assert_eq!(parse_percent("13%"), Some(13.0));
         assert_eq!(parse_percent("<unknown>"), None);
+    }
+
+    const TOP_PODS: &str = "NAMESPACE   POD              CONTAINER   CPU(cores)   MEMORY(bytes)\n\
+         default     web-7f9c-abc     app         12m          88Mi\n\
+         default     web-7f9c-abc     sidecar     3m           21Mi\n\
+         kube-system coredns-5d77     coredns     1500m        1.5Gi\n\
+         monitoring  node-x-q1        exporter    <unknown>    44Mi\n\
+         No resources found.\n";
+
+    #[test]
+    fn top_pods_parses_by_header_and_skips_unparsable_rows() {
+        let rows = parse_top_pods(TOP_PODS);
+        assert_eq!(rows.len(), 3, "<unknown> CPU and prose lines must not fabricate rows");
+        assert_eq!(rows[0], KubePod { namespace: "default".into(), pod: "web-7f9c-abc".into(), container: "app".into(), cpu_milli: 12, mem_bytes: 88 << 20 });
+        // Same pod, two containers -> two rows (per-container view).
+        assert_eq!(&rows[0].pod, &rows[1].pod);
+        assert_eq!(rows[2].cpu_milli, 1500);
+        assert_eq!(rows[2].mem_bytes, (1.5f64 * (1u64 << 30) as f64) as u64);
+    }
+
+    #[test]
+    fn top_pods_parses_modern_container_named_name() {
+        // Verbatim shape from `kubectl top pods -A --containers` on v1.36 k3s (2026-10-11):
+        // the CONTAINER column is labeled NAME and POD exists — NAME must NOT become pod.
+        let text = "NAMESPACE                 POD                                      NAME            CPU(cores)   MEMORY(bytes)\n\
+arc-system                arc-domination-684cc596-listener         listener        1m           22Mi\n";
+        let rows = parse_top_pods(text);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pod, "arc-domination-684cc596-listener");
+        assert_eq!(rows[0].container, "listener");
+        assert_eq!(rows[0].cpu_milli, 1);
+    }
+
+    #[test]
+    fn top_pods_accepts_legacy_name_column() {
+        // kubectl <= 1.28 labels the second header token NAME, not POD.
+        let text = "NAMESPACE   NAME             CONTAINER   CPU(cores)   MEMORY(bytes)\nk v   w  5m  10Mi\n";
+        let rows = parse_top_pods(text);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pod, "v");
+        assert_eq!(rows[0].container, "w");
+    }
+
+    #[test]
+    fn pvcs_parse_projection_and_sentinels() {
+        // Column order follows PVC_COLUMNS exactly: NS NAME PHASE CAP CLASS VOL.
+        let text = "db      postgres-data-0   Bound    10Gi   local-path   pvc-abc\n\
+             default  temp-scratch      Pending  <none>  -   fast-storage\n\
+             truncated line here\n";
+        let rows = parse_pvcs(text);
+        assert_eq!(rows.len(), 2, "short/malformed lines are dropped");
+        assert_eq!(rows[0].capacity_bytes, Some(10u64 << 30));
+        assert_eq!(rows[0].class, "local-path");
+        assert_eq!(rows[0].volume, "pvc-abc");
+        // Unbound claim: capacity "<none>" parses as None (NOT zero), class "-" cleaned.
+        assert_eq!(rows[1].phase, "Pending");
+        assert_eq!(rows[1].capacity_bytes, None);
+        assert_eq!(rows[1].class, "-");
+        assert_eq!(rows[1].volume, "fast-storage");
     }
 }

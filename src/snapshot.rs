@@ -138,3 +138,27 @@ pub struct KubeNode {
     pub mem_bytes: Option<u64>,
     pub mem_pct: Option<f32>,
 }
+
+/// One container's live usage from `kubectl top pods --containers`. Kubernetes exposes
+/// workloads as pods/containers, not OS processes — this is what kubectl can honestly see.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KubePod {
+    pub namespace: String,
+    pub pod: String,
+    pub container: String,
+    pub cpu_milli: u64,
+    pub mem_bytes: u64,
+}
+
+/// A PersistentVolumeClaim: provisioned storage a workload reserved. Metrics-server does
+/// not report filesystem usage INSIDE a volume (that needs Prometheus/kubelet stats), so
+/// ccc reports capacity/status/class truthfully instead of inventing a percentage.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KubePvc {
+    pub namespace: String,
+    pub name: String,
+    pub phase: String,
+    pub capacity_bytes: Option<u64>,
+    pub class: String,
+    pub volume: String,
+}

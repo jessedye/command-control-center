@@ -7,7 +7,7 @@
 //! status lamps, `>>  WARN ... <<` chevrons, footer with station/uptime/load/clock/alerts.
 
 use crate::format;
-use crate::snapshot::{KubeNode, Station};
+use crate::snapshot::{KubeNode, KubePod, KubePvc, Station};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
@@ -108,30 +108,30 @@ const CORE_RAMP: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '
 
 /// Segmented horizontal gauge, exactly `width` cells, quarter-capacity tick marks.
 /// Cell fill uses the quarter-ramp (`▏▎▌█`) so partial values stay honest.
+/// Smooth eighth-block gauge on a transparent background (owner visual pass 2026-10-11:
+/// '░' filler + '|' quarter ticks read as noisy scaffolding at table scale; ▁..█ ramps read
+/// as one continuous fill). Width is EXACTLY `width` cells — spaces are real cells, so
+/// columns stay aligned against {:<14} headers.
 pub fn bar(pct: f64, width: usize) -> String {
+    const RAMP: [char; 8] = ['\u{250F}', '▏', '▎', '▍', '▌', '▋', '▊', '▉']; // ▏..▉ 1/8..7/8
     let w = width.max(1);
     let p = if pct.is_finite() { pct.clamp(0.0, 100.0) } else { 0.0 };
     let exact = p / 100.0 * w as f64;
     let full = (exact.floor() as usize).min(w);
-    let rem = exact - exact.floor();
-    let mut chars: Vec<char> = (0..w)
-        .map(|i| {
-            if i < full {
-                '█'
-            } else if i == full {
-                RAMP[(rem * 4.0).round().clamp(0.0, 3.0) as usize]
-            } else {
-                '░'
-            }
-        })
-        .collect();
-    // Quarter ticks overwrite the cell completing each quarter: 25% 50% 75%.
-    for q in [w / 4, w / 2, (3 * w) / 4] {
-        if q > 0 && q < w {
-            chars[q - 1] = '|';
-        }
+    let frac = exact - exact.floor();
+    // Floor into the eighth-block ramp; a cell only advances once its whole fraction
+    // is paid for, so a 5%-of-width cell never looks like a full block.
+    let head = if frac <= 0.0 || full >= w {
+        None
+    } else {
+        Some(RAMP[((frac * 8.0).floor() as usize).min(7)])
+    };
+    let mut out: String = std::iter::repeat('█').take(full).collect();
+    if let Some(c) = head {
+        out.push(c);
     }
-    chars.into_iter().collect()
+    out.extend(std::iter::repeat(' ').take(w - full - head.map_or(0, |_| 1)));
+    out
 }
 
 /// Per-core vertical strip: one glyph per core, height ∝ utilization.
@@ -202,6 +202,9 @@ pub struct UiStation<'a> {
     pub host: Option<&'a Station>,
     pub err: Option<String>,
     pub kube: Option<&'a [KubeNode]>,
+    /// Container usage rows and PVC claims from the same fleet poll (empty when unavailable).
+    pub kube_pods: &'a [KubePod],
+    pub kube_pvcs: &'a [KubePvc],
     /// Human-readable reason `kubectl top` produced no metrics (review fix #23) — kept
     /// verbatim so RBAC/API failures aren't silently labeled "no metrics-server".
     pub kube_note: Option<String>,
@@ -247,13 +250,6 @@ fn header_rows(view: &View) -> Vec<Row> {
     let w = view.width as usize;
     let cur = view.stations.get(view.focus);
     let mut rows: Vec<Row> = Vec::new();
-
-    let right_gauge = |label: &str, pct: f64| -> Row {
-        let mut r = mini_gauge(label, pct, view, 8);
-        // Right rail is fixed width; drop the percent for narrow widths handled by pad.
-        r.extend(vec![seg(" ", St::Normal)]);
-        r
-    };
 
     let station_label = cur.map(|s| s.title()).unwrap_or_default();
     // Fleet slots have no Station/HostInfo, so they previously rendered the same
@@ -332,44 +328,57 @@ fn header_rows(view: &View) -> Vec<Row> {
         r.extend(mid);
         rows.push(r);
     }
-    // Right rail gauges for the focused station (rows 1..5).
-    if w >= 58 {
-        if let Some(s) = cur {
-            let rails: Vec<(&str, f64)> = match s.host {
-                Some(h) => {
-                    let nvram = gpu_avg_pct(h);
-                    vec![("CPU", h.cpu_avg_pct as f64), ("MEM", h.mem_pct()), ("NVRAM", nvram), ("DISK", disk_max_pct(h))]
-                }
-                // Fleet slots roll up `kubectl top` usage-vs-allocatable into the same bars;
-                // nodes without a metric are skipped so metrics-server gaps can't read as 0%.
-                None => match s.kube {
-                    Some(k) => {
-                        let avg = |get: fn(&KubeNode) -> Option<f32>| -> f64 {
-                            let v: Vec<f64> = k.iter().filter_map(get).map(f64::from).collect();
-                            if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 }
-                        };
-                        vec![
-                            ("CPU", avg(|n| n.cpu_pct)),
-                            ("MEM", avg(|n| n.mem_pct)),
-                            ("NVRAM", 0.0),
-                            ("DISK", 0.0),
-                        ]
-                    }
-                    None => vec![("CPU", 0.0), ("MEM", 0.0), ("NVRAM", 0.0), ("DISK", 0.0)],
-                },
+    // Right rail gauges for the focused station (rows 1..4). Width-tiered (owner report
+    // 2026-10-11: fleet tab showed ZERO gauges on wide-looking real terminals — a fixed
+    // gate silently suppresses ALL visuals when effective columns fall below it, exactly
+    // what HiDPI/large-font terminals report). Tiers degrade the RAIL, never remove it:
+    // rich >= 92 cols, compact >= 40, numeric-text >= 24.
+    if let Some(s) = cur {
+        let host_rails: Vec<(&str, f64)> = match s.host {
+            Some(h) => {
+                let nvram = gpu_avg_pct(h);
+                vec![("CPU", h.cpu_avg_pct as f64), ("MEM", h.mem_pct()), ("NVRAM", nvram), ("DISK", disk_max_pct(h))]
+            }
+            None => vec![("CPU", 0.0), ("MEM", 0.0), ("NVRAM", 0.0), ("DISK", 0.0)],
+        };
+        // Fleet slots roll up `kubectl top` usage-vs-allocatable; nodes without a metric are
+        // skipped so metrics-server gaps can't read as 0%. NVRAM/DISK are concepts a fleet
+        // does not have — showing 0% there is noise (and reads as "all nodes at zero").
+        let mut rails: Vec<(&str, f64)> = match s.kube {
+            Some(k) => {
+                let avg = |get: fn(&KubeNode) -> Option<f32>| -> f64 {
+                    let v: Vec<f64> = k.iter().filter_map(get).map(f64::from).collect();
+                    if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 }
+                };
+                vec![("CPU", avg(|n| n.cpu_pct)), ("MEM", avg(|n| n.mem_pct))]
+            }
+            None => host_rails.clone(),
+        };
+        // Full bars at >= 40 columns; pure numbers under 40 (bar+brackets+label need ~21
+        // cells to stay readable and not eat the title). Below 24 nothing fits at all.
+        let bar_mode = w >= 40;
+        if !bar_mode {
+            rails.retain(|(label, _)| matches!(*label, "CPU" | "MEM"));
+        }
+        for (i, (label, pct)) in rails.iter().enumerate().take(4) {
+            let row_idx = (1 + i).min(rows.len() - 1);
+            let gauge: Row = if bar_mode {
+                let mut r = mini_gauge(label, *pct, view, 8);
+                r.push(seg(" ".to_string(), St::Normal));
+                r
+            } else {
+                let st = sev_sym(*pct, view);
+                vec![seg(format!("{label:>3} {:.0}%", *pct), st)]
             };
-            for (i, (label, pct)) in rails.iter().enumerate() {
-                let row = &mut rows[1 + i];
-                append_right_aligned(row, &right_gauge(label, *pct), w);
-            }
-            if let Some(k) = s.kube {
-                let ready = k.iter().filter(|n| kube_ready(&n.status)).count();
-                append_right_aligned(
-                    &mut rows[0],
-                    &[seg(format!("NODES {ready}/{}", k.len()), St::Ident)],
-                    w,
-                );
-            }
+            append_right_aligned(&mut rows[row_idx], &gauge, w);
+        }
+        if let Some(k) = s.kube {
+            let ready = k.iter().filter(|n| kube_ready(&n.status)).count();
+            append_right_aligned(
+                &mut rows[0],
+                &[seg(format!("NODES {ready}/{}", k.len()), St::Ident)],
+                w,
+            );
         }
     }
     rows
@@ -716,9 +725,12 @@ fn kube_table(view: &View) -> Vec<Row> {
         return rows;
     };
     let Some(nodes) = st.kube else { return rows };
+    // Owner report 2026-10-11: "k8s shows no visuals or graphs". Node CPU/MEM columns
+    // carry an inline heat bar + number per row, colored against --warn/--crit. Cells widen
+    // from {:>6} to {:<14}; narrow windows lose the tail via finish_row like every table here.
     rows.push(vec![
         seg("FLEET ", St::Head),
-        seg(format!("{:<22} {:<12} {:<14} {:>6} {:>6}", "NODE", "STATUS", "ROLES", "CPU%", "MEM%"), St::Head),
+        seg(format!("{:<22} {:<12} {:<14} {:<14} {:<14}", "NODE", "STATUS", "ROLES", "CPU", "MEM"), St::Head),
     ]);
     for n in nodes.iter().take(if view.verbose { 32 } else { 8 }) {
         // Review fix #23: readiness is one of the comma-joined conditions — a cordoned
@@ -727,14 +739,24 @@ fn kube_table(view: &View) -> Vec<Row> {
         // Field separators must mirror the header format EXACTLY (round-2 era layout bug
         // caught in live k8s capture: header has spaces between columns, rows had none, so
         // a 22-char hostname rendered flush against "Ready").
+        // Fixed 14-cell column: bar(9) + space + right-aligned percent ({:>4} keeps the
+        // cell exact for 1..=100, so roles/CPU/MEM stay aligned against their {:<14} headers.
+        let cell = |p: Option<f32>| -> (String, St) {
+            match p {
+                Some(v) => (format!("{:<14}", format!("{} {:>3}%", bar(f64::from(v).clamp(0.0, 100.0), 9), v.round())), sev_sym(f64::from(v), view)),
+                None => (format!("{:<14}", "-"), St::Dim),
+            }
+        };
+        let (cpu_s, cpu_c) = cell(n.cpu_pct);
+        let (mem_s, mem_c) = cell(n.mem_pct);
         rows.push(vec![
             seg(format!("{:<22} ", trunc_cell(&n.name, 22)), St::Normal),
             // Round-2 finding 32: "Ready,SchedulingDisabled" is 22 cells — the header says
             // STATUS at 12; truncate to keep roles/metrics columns aligned.
             seg(format!("{:<12} ", trunc_cell(&n.status, 12)), st),
             seg(format!("{:<14} ", trunc_cell(&n.roles, 14)), St::Dim),
-            seg(format!("{:>6} ", n.cpu_pct.map(|v| format!("{v:.0}%")).unwrap_or("-".into())), St::Normal),
-            seg(format!("{:>6}", n.mem_pct.map(|v| format!("{v:.0}%")).unwrap_or("-".into())), St::Normal),
+            seg(format!("{cpu_s} "), cpu_c),
+            seg(mem_s, mem_c),
         ]);
     }
     if !nodes.is_empty() && nodes[0].cpu_millis.is_none() && nodes[0].cpu_pct.is_none() {
@@ -746,7 +768,85 @@ fn kube_table(view: &View) -> Vec<Row> {
             .unwrap_or_else(|| "metrics-server reports no metrics — showing node status only".to_string());
         rows.push(vec![seg(format!("       {why}"), St::Dim)]);
     }
+
+    // TOP PODS — the cluster-native analog of TOP PROCS. Kubernetes exposes containers,
+    // not OS processes (kubectl cannot see host PIDs — that needs an SSH station on each
+    // node). Bars are RELATIVE to the hottest container in this poll: a heat map for
+    // "what is hot in my cluster", not an absolute-% reading.
+    if !st.kube_pods.is_empty() {
+        rows.push(vec![seg(String::new(), St::Dim)]); // section breathing room (visual pass)
+        let mut ranked: Vec<&crate::snapshot::KubePod> = st.kube_pods.iter().collect();
+        ranked.sort_by(|a, b| b.cpu_milli.cmp(&a.cpu_milli).then_with(|| b.mem_bytes.cmp(&a.mem_bytes)));
+        let n_total = ranked.len();
+        let cap = if view.verbose { 16 } else { 8 };
+        let max_cpu = ranked.first().map(|p| p.cpu_milli.max(1)).unwrap_or(1);
+        rows.push(vec![seg(format!("TOP PODS · usage via kubectl top · {} of {n_total} shown (bar: % of hottest)", cap.min(n_total)), St::Head)]);
+        rows.push(vec![seg(format!("{:<12} {:<22} {:<10} {:<10} {:>5} {:>8}", "NS", "POD", "CONTAINER", "CPU", "CORES", "MEM"), St::Head)]);
+        for p in ranked.into_iter().take(cap) {
+            let share = ((p.cpu_milli as f64 / max_cpu as f64) * 100.0).clamp(1.0, 100.0);
+            rows.push(vec![
+                seg(format!("{:<12} ", trunc_cell(&p.namespace, 12)), St::Dim),
+                seg(format!("{:<22} ", trunc_cell(&p.pod, 22)), St::Normal),
+                seg(format!("{:<10} ", trunc_cell(&p.container, 10)), St::Dim),
+                seg(bar(share, 10), sev_sym(share, view)),
+                seg(format!(" {:>4} ", cpu_label(p.cpu_milli)), St::Normal),
+                seg(format!("{:>8}", format::fmt_bytes(p.mem_bytes)), St::Dim),
+            ]);
+        }
+    }
+    if st.kube_pods.is_empty() {
+        if let Some(why) = split_note(st.kube_note.as_deref(), "pods") {
+            rows.push(vec![seg(format!("       pod metrics unavailable: {}", trunc_cell(&why, 76)), St::Dim)]);
+        }
+    }
+
+    // PVC — provisioned storage claims. Metrics-server does not report filesystem USAGE
+    // inside a volume, so ccc shows capacity/status/class truthfully instead of inventing
+    // a percentage; true usage needs Prometheus/kubelet stats.
+    if !st.kube_pvcs.is_empty() {
+        rows.push(vec![seg(String::new(), St::Dim)]);
+        let mut ranked: Vec<&crate::snapshot::KubePvc> = st.kube_pvcs.iter().collect();
+        ranked.sort_by_key(|p| std::cmp::Reverse(p.capacity_bytes.unwrap_or(0)));
+        let bound = ranked.iter().filter(|p| p.phase == "Bound").count();
+        let provisioned = format::fmt_bytes(ranked.iter().filter_map(|p| p.capacity_bytes).sum::<u64>());
+        rows.push(vec![seg(format!("PVC · {bound}/{} bound · {provisioned} provisioned", ranked.len()), St::Head)]);
+        rows.push(vec![seg(format!("{:<12} {:<22} {:<9} {:>9} {:<14}", "NS", "CLAIM", "PHASE", "SIZE", "CLASS"), St::Head)]);
+        for c in ranked.into_iter().take(if view.verbose { 16 } else { 6 }) {
+            let ph = match c.phase.as_str() {
+                "Bound" => St::Ok,
+                "Pending" => St::Warn,
+                _ => St::Crit,
+            };
+            rows.push(vec![
+                seg(format!("{:<12} ", trunc_cell(&c.namespace, 12)), St::Dim),
+                seg(format!("{:<22} ", trunc_cell(&c.name, 22)), St::Normal),
+                seg(format!("{:<9} ", trunc_cell(&c.phase, 9)), ph),
+                seg(format!("{:>9} ", c.capacity_bytes.map(format::fmt_bytes).unwrap_or_else(|| "-".to_string())), St::Normal),
+                seg(trunc_cell(&c.class, 14), St::Dim),
+            ]);
+        }
+    }
+    if st.kube_pvcs.is_empty() {
+        if let Some(why) = split_note(st.kube_note.as_deref(), "pvcs") {
+            rows.push(vec![seg(format!("       storage claims unavailable: {}", trunc_cell(&why, 76)), St::Dim)]);
+        }
+    }
     rows
+}
+
+/// Millicores as humans read them: 88m small, 1.5c cores.
+fn cpu_label(milli: u64) -> String {
+    if milli >= 1000 {
+        format!("{:.1}c", milli as f64 / 1000.0)
+    } else {
+        format!("{milli}m")
+    }
+}
+
+/// Pull one sub-section's reason out of the joined note string (join_notes uses "; ").
+fn split_note(note: Option<&str>, key: &str) -> Option<String> {
+    let prefix = format!("{key}: ");
+    note?.split("; ").find_map(|seg| seg.strip_prefix(prefix.as_str())).map(str::to_string)
 }
 
 fn proc_table(view: &View, multi_host: bool, max_rows: usize) -> Vec<Row> {
@@ -1082,23 +1182,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bar_extremes_and_quarter_ticks() {
-        let empty = bar(0.0, 20);
-        assert_eq!(empty.matches('|').count(), 3); // quarter ticks 25/50/75%
-        assert_eq!(empty.matches('░').count(), 17);
-        assert_eq!(empty.chars().count(), 20);
-        assert!(bar(100.0, 20).chars().all(|c| c == '█' || c == '|'));
-        assert_eq!(bar(50.0, 20).chars().count(), 20);
-        // Width must be exactly preserved for table alignment.
-        for w in [8, 10, 12, 20, 25] {
+    fn bar_smooth_width_and_fill_contract() {
+        assert_eq!(bar(0.0, 9), " ".repeat(9));
+        assert_eq!(bar(100.0, 9), "█".repeat(9));
+        assert_eq!(bar(-5.0, 10), bar(0.0, 10));
+        assert_eq!(bar(150.0, 10), bar(100.0, 10));
+        assert_eq!(visible_width(&bar(f64::NAN, 10)), 10);
+        // Exact cell width at every size/value, first char full for >=1/w of usage.
+        for w in [8, 9, 10, 20, 25] {
             for p in [0.0, 12.0, 33.3, 63.4, 91.0, 100.0] {
                 assert_eq!(visible_width(&bar(p, w)), w, "bar({p},{w})");
             }
         }
-        // NaN/negative/incoming-garbage clamp safely.
-        assert_eq!(visible_width(&bar(f64::NAN, 10)), 10);
-        assert_eq!(visible_width(&bar(-5.0, 10)), 10);
-        assert_eq!(visible_width(&bar(150.0, 10)), 10);
+        assert!(bar(55.0, 10).starts_with("█████")); // >= half full
+        assert!(!bar(55.0, 10).contains('░'));      // no blocky filler left
     }
 
     #[test]
@@ -1132,5 +1229,102 @@ mod tests {
     fn spark_pads_short_history() {
         assert_eq!(spark(&[50.0, 100.0], 4), "  ▅█");
         assert_eq!(spark(&[], 3), "   ");
+    }
+}
+
+#[cfg(test)]
+mod fleet_render_tests {
+    use super::*;
+    use crate::snapshot::{KubeNode, KubePod, KubePvc};
+
+    fn node(name: &str, status: &str, cpu: Option<f32>) -> KubeNode {
+        KubeNode {
+            name: name.into(),
+            status: status.into(),
+            roles: "worker".into(),
+            age: "210d".into(),
+            version: "v1.36.2+k3s1".into(),
+            cpu_millis: cpu.map(|v| v as u64 * 100),
+            cpu_pct: cpu,
+            mem_bytes: Some(2 << 30),
+            mem_pct: Some(30.0),
+        }
+    }
+
+    fn view_with_fleet<'a>(width: u16, nodes: &'a [KubeNode], pods: &'a [KubePod], pvcs: &'a [KubePvc]) -> View<'a> {
+        View {
+            clock: "00:00:00Z".into(),
+            epoch: 0,
+            spin: '*',
+            stations: vec![UiStation {
+                label: "K8S:test".into(),
+                host: None,
+                err: None,
+                kube: Some(nodes),
+                kube_pods: pods,
+                kube_pvcs: pvcs,
+                kube_note: None,
+                hist_cpu: Vec::new(),
+                hist_mem: Vec::new(),
+                sample_ts: 0,
+            }],
+            focus: 0,
+            sort_label: "CPU",
+            top: 10,
+            verbose: false,
+            paused: false,
+            warn: 60.0,
+            crit: 85.0,
+            width,
+            height: 44,
+        }
+    }
+
+    fn fixtures() -> (Vec<KubeNode>, Vec<KubePod>, Vec<KubePvc>) {
+        (
+            vec![node("fed-node-1.lab.local", "Ready", Some(11.0)), node("fed-node-2", "NotReady", Some(77.0))],
+            vec![KubePod { namespace: "default".into(), pod: "web-7f9c-abc".into(), container: "app".into(), cpu_milli: 1200, mem_bytes: 88 << 20 }],
+            vec![KubePvc { namespace: "db".into(), name: "postgres-data-0".into(), phase: "Bound".into(), capacity_bytes: Some(10 << 30), class: "local-path".into(), volume: "pvc-abc".into() }],
+        )
+    }
+
+    #[test]
+    fn fleet_panel_renders_bars_top_pods_and_pvcs() {
+        let (nodes, pods, pvcs) = fixtures();
+        let text = to_plain(&build_rows(&view_with_fleet(120, &nodes, &pods, &pvcs))).join("\n");
+        // Node rows carry inline bar+percent cells (owner report: fleet tab was all text).
+        let n1 = text.lines().find(|l| l.contains("fed-node-1")).expect("node row");
+        assert!(n1.contains("11%"), "cpu percent visible: {n1}");
+        assert!(n1.chars().any(|c| c == '░' || c == '█'), "bar glyphs present: {n1}");
+        // NotReady node keeps its red status column value verbatim.
+        assert!(text.lines().any(|l| l.contains("fed-node-2") && l.contains("NotReady")));
+        // Sections appear with headers and data.
+        assert!(text.contains("TOP PODS"), "{text}");
+        assert!(text.contains("web-7f9c-abc") && text.contains("1.2c"));
+        assert!(text.contains("PVC · 1/1 bound · 10.0 GiB provisioned"), "{text}");
+        assert!(text.contains("postgres-data-0") && text.contains("local-path"));
+        // Right-rail gauges roll up the fleet average ((11+77)/2 = 44% CPU, 30% MEM).
+        assert!(text.contains("44%"), "fleet average cpu in rail: {text}");
+        assert!(text.contains("NODES 1/2"), "ready chip: {text}");
+    }
+
+    #[test]
+    fn narrow_terminal_keeps_numeric_gauges_never_blanks() {
+        // The exact regression owner hit: a terminal narrower than the bar layout must
+        // degrade to numeric readouts, NOT drop the rails entirely.
+        let (nodes, pods, pvcs) = fixtures();
+        let text = to_plain(&build_rows(&view_with_fleet(30, &nodes, &pods, &pvcs))).join("\n");
+        assert!(text.contains("CPU 44%"), "{text}");
+        assert!(text.contains("MEM 30%"), "{text}");
+    }
+
+    #[test]
+    fn cpu_label_cores_and_millis() {
+        assert_eq!(cpu_label(88), "88m");
+        assert_eq!(cpu_label(999), "999m");
+        assert_eq!(cpu_label(1200), "1.2c");
+        assert_eq!(split_note(Some("top failed; pods: kubectl exited 1: denied"), "pods").as_deref(), Some("kubectl exited 1: denied"));
+        assert_eq!(split_note(None, "pods"), None);
+        assert_eq!(split_note(Some("unrelated note"), "pods"), None);
     }
 }

@@ -85,8 +85,10 @@ knobs, troubleshooting — is in the [setup guide](docs/SETUP.md).
 - **Alerts** — red banner lines for anything past `--crit`, counted in the footer. A dead
   SSH link keeps the last good frame on screen stamped `⚠ STALE` instead of blanking.
 
-The Kubernetes tab lists nodes with cpu/mem requests vs capacity, colors non-`Ready`
-nodes, and explains why metrics are missing when `metrics-server` isn't installed.
+The Kubernetes tab lists every node with inline CPU/MEM heat bars from `kubectl top`,
+ranks your workloads by live usage (TOP PODS, per container), and inventories storage
+claims with phase and provisioned size (PVC). Non-`Ready` nodes render red, and when
+metrics-server is missing the panel says exactly why instead of showing blanks.
 
 ## How it works
 

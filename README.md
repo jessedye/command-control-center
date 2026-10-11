@@ -26,6 +26,37 @@ single-digit megabytes of RSS.
 cargo build --release          # -> target/release/ccc  (Rust 1.95+)
 ```
 
+## Dependencies
+
+`ccc` itself is a single Rust binary with no runtime libraries. Three external command-line
+tools are used by specific features, so each is required only when that feature is configured:
+
+| Tool | Needed for | Package (Fedora / Debian) |
+| --- | --- | --- |
+| `ssh` | remote stations (`-H`) and Proxmox seeds (`-P`) | openssh-clients / openssh-client |
+| `sshpass` | password auth (`--pass FILE` or config `pass`) | sshpass (EPEL on RHEL) / sshpass |
+| `kubectl` | the Kubernetes tab (`--k8s`, config `k8s`) | kubernetes-client / snap install kubectl --classic |
+
+At startup ccc checks every tool the launch will actually exec — a local-only run asks for
+nothing. For each missing tool on an interactive terminal it offers to install it through your
+detected package manager:
+
+```
+ccc: 1 optional tool(s) missing for this launch:
+  • sshpass — --pass password auth (feeds the password to ssh non-interactively)
+Package manager detected: Dnf
+Install 'sshpass' now? [y]es ([dnf] package) · [d] download instructions · [n] skip > y
+running: dnf install -y sshpass
+sshpass installed.
+```
+
+`y` runs the install (sudo-prefixed unless you're root) and re-checks; `d` prints the
+install command and upstream link instead of running anything; `n` skips. In non-interactive
+launches (`--once`, cron, pipes) there is nothing to prompt, so ccc prints the same hints and
+exits with code **3** rather than starting a session whose remote tabs would fail at every
+sample. Ceph health on Proxmox clusters is collected over SSH using python3 on the hypervisor
+itself — your workstation needs nothing extra.
+
 ## Run
 
 Set up your fleet once and every launch after that is just `ccc`:

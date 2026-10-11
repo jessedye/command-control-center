@@ -284,3 +284,46 @@ if your policy demands.)
   control-character sanitized before it reaches your terminal — a malicious remote cannot
   inject escape sequences into the dashboard.
 - `ccc` sends NO data anywhere except the ssh destinations you name. There is no telemetry.
+
+## 9. Dependencies: checking and installing
+
+`ccc` shells out to three tools, each required only by the feature you configure:
+
+- **ssh** — every remote station (`-H`) and every Proxmox seed (`-P`). The collector rides
+  `ssh <host> sh -s`; nothing is installed on the far side. Package: `openssh-clients`
+  (Fedora/RHEL), `openssh-client` (Debian/Ubuntu).
+- **sshpass** — password-mode auth. When `--pass FILE` (or a config `pass` line) is present,
+  ccc wraps ssh as `sshpass -f FILE ssh …`; without the binary every password station fails.
+  Package: `sshpass` (EPEL on RHEL-family). Key-based stations never need it.
+- **kubectl** — the Kubernetes tab only. It talks to clusters through your kubeconfig, so
+  existing contexts, namespaces, and auth plugins keep working. Not shipped by every distro:
+  Fedora has `kubernetes-client`; Debian/Ubuntu users typically install from upstream
+  (<https://kubernetes.io/docs/tasks/tools/>); `ccc` prints exactly that guidance for you.
+
+### What the check looks like
+
+Before connecting anywhere, startup probes each tool this launch will exec. Missing tools on
+an interactive terminal get an offer:
+
+```
+ccc: 1 optional tool(s) missing for this launch:
+  • sshpass — --pass password auth (feeds the password to ssh non-interactively)
+Package manager detected: Dnf
+Install 'sshpass' now? [y]es ([dnf] package) · [d] download instructions · [n] skip > y
+running: dnf install -y sshpass
+sshpass installed.
+```
+
+- `y` runs the package manager's install (prefixed with `sudo` unless you are root), then
+  re-probes; success continues straight into the dashboard.
+- `d` prints the exact package command (and the upstream project site where relevant) and
+  leaves the choice of running it to you.
+- `n` skips — if the launch still needs the tool, ccc exits with code 3 and says why,
+  instead of opening tabs that fail at every sample.
+- Non-interactive launches (`--once`, cron, pipes) print the same hint lines and exit 3 when
+  anything required is missing; prompts would just hang.
+
+Local-only dashboards (`ccc` with no `-H`/`--k8s`/`-P` and no config stations) require no
+external binaries at all, so the check is silent. Ceph health on PVE uses `ceph status
+--format json | python3` **on the hypervisor** over the existing SSH session — there is no
+client-side dependency for it.

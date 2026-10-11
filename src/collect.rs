@@ -557,12 +557,69 @@ pub struct RemoteCollector {
     /// Extra ssh argv (jump hosts, ports, identity files...).
     pub ssh_args: Vec<String>,
     pub host: String,
+    /// Password file for `sshpass -f` (Proxmox root auth has no key by default). None =
+    /// plain key-based ssh via BatchMode; Some switches to sshpass + accept-new host keys.
+    pub pass_file: Option<String>,
     net_base: NetBaseline,
     prev_at: Instant,
 }
 
+/// One-shot remote execution shared by RemoteCollector and the PVE collector: runs `script`
+/// on `host` through `ssh host sh -s`, stdin-piped, deadline-bounded. With `pass_file` set,
+/// the invocation is wrapped in `sshpass -f FILE`.
+///
+/// CRITICAL pairing: password mode must NOT send `-o BatchMode=yes` — BatchMode disables
+/// every interactive prompt, which includes the very password prompt sshpass exists to
+/// answer; keeping it makes sshpass exit 5 ("no more passwords") instantly. Password mode
+/// also sets StrictHostKeyChecking=accept-new so first contact with a discovered node can
+/// never block on a yes/no prompt (the original BatchMode's purpose).
+pub fn run_remote_script(
+    script: &str,
+    ssh_args: &[String],
+    host: &str,
+    pass_file: Option<&str>,
+) -> Result<String, String> {
+    let (program, mut args): (&str, Vec<String>) = match pass_file {
+        Some(f) => (
+            "sshpass",
+            vec![
+                "-f".to_string(),
+                f.to_string(),
+                "ssh".to_string(),
+                "-T".to_string(),
+                "-o".to_string(),
+                "StrictHostKeyChecking=accept-new".to_string(),
+            ],
+        ),
+        None => {
+            let mut v = vec!["-T".to_string()];
+            v.extend(["-o".to_string(), "BatchMode=yes".to_string()]);
+            ("ssh", v)
+        }
+    };
+    // ConnectTimeout applies to ssh in both modes (it rides inside sshpass's ssh argv as a
+    // passthrough option because anything after `ssh` below is ssh's argv).
+    args.extend([
+        "-o".to_string(),
+        "ConnectTimeout=8".to_string(),
+    ]);
+    args.extend(ssh_args.iter().cloned());
+    args.push(host.to_string());
+    args.push("sh -s".to_string());
+
+    let (code, stdout, stderr) = run_bounded(program, &args, Some(script.as_bytes()), SSH_TIMEOUT)?;
+    match code {
+        Some(0) => Ok(String::from_utf8_lossy(&stdout).into_owned()),
+        Some(c) => {
+            let tail = format::trunc(String::from_utf8_lossy(&stderr).trim(), 160);
+            Err(format!("{program} exited {c} {tail}"))
+        }
+        None => Err("ssh killed by signal".to_string()),
+    }
+}
+
 impl RemoteCollector {
-    pub fn new(label: String, host: String, mut ssh_args: Vec<String>) -> Self {
+    pub fn new(label: String, host: String, mut ssh_args: Vec<String>, pass_file: Option<String>) -> Self {
         // Multiplex: first connection pays the handshake, later polls ride the socket.
         let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_e| "/tmp".to_string());
         ssh_args.extend([
@@ -573,7 +630,7 @@ impl RemoteCollector {
             "-o".to_string(),
             "ControlPersist=300".to_string(),
         ]);
-        Self { label, host, ssh_args, net_base: NetBaseline::new(), prev_at: Instant::now() }
+        Self { label, host, ssh_args, pass_file, net_base: NetBaseline::new(), prev_at: Instant::now() }
     }
 
     pub fn sample(&mut self) -> Result<Station, String> {
@@ -602,29 +659,11 @@ impl RemoteCollector {
     }
 
     /// Run `script` through `ssh host sh -s`, returning stdout. Connection setup failures
-    /// surface with the ssh exit code and stderr tail (BatchMode guarantees no prompts).
-    /// Review fix #7: the whole invocation is deadline-bounded and its pipes drained.
+    /// surface with the exit code and stderr tail. Review fix #7: the whole invocation is
+    /// deadline-bounded and its pipes drained. With pass_file set this goes through sshpass
+    /// (see run_remote_script for why BatchMode must be off in that mode).
     fn ssh_run(&self, script: &str) -> Result<String, String> {
-        let mut args = vec![
-            "-T".to_string(),
-            "-o".to_string(),
-            "BatchMode=yes".to_string(),
-            "-o".to_string(),
-            "ConnectTimeout=8".to_string(),
-        ];
-        args.extend(self.ssh_args.iter().cloned());
-        args.push(self.host.clone());
-        args.push("sh -s".to_string());
-
-        let (code, stdout, stderr) = run_bounded("ssh", &args, Some(script.as_bytes()), SSH_TIMEOUT)?;
-        match code {
-            Some(0) => Ok(String::from_utf8_lossy(&stdout).into_owned()),
-            Some(c) => {
-                let tail = format::trunc(String::from_utf8_lossy(&stderr).trim(), 160);
-                Err(format!("ssh exited {c} {tail}"))
-            }
-            None => Err("ssh killed by signal".to_string()),
-        }
+        run_remote_script(script, &self.ssh_args, &self.host, self.pass_file.as_deref())
     }
 }
 

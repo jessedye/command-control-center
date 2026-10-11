@@ -3,10 +3,12 @@
 mod app;
 mod collect;
 mod config;
+mod deps;
 mod format;
 mod gpu;
 mod kube;
 mod proto;
+mod pve;
 mod render;
 mod snapshot;
 
@@ -58,6 +60,24 @@ struct Opts {
     /// Watch Kubernetes nodes via kubectl (`--k8s[=CONTEXT]`; bare flag = current context).
     #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "CONTEXT")]
     k8s: Option<String>,
+
+    /// Watch a Proxmox VE cluster through one seed node; repeatable. VALUE is ssh
+    /// destination tokens, optionally labeled: "lab=root@192.168.51.241". One seed
+    /// connection yields every hypervisor, guest VM/container, storage volume and the
+    /// Ceph health summary. Given any -H/-P/--k8s, config-file station lines are ignored.
+    #[arg(short = 'P', long = "proxmox", value_name = "SPEC")]
+    proxmox: Vec<String>,
+
+    /// Password file for password-authenticated SSH (passed to `sshpass -f`; contents are
+    /// never read into your terminal). Applies to every -H/-P station. Keep the file at
+    /// mode 600 outside any repo. Requires the sshpass binary installed.
+    #[arg(long, value_name = "FILE")]
+    pass: Option<PathBuf>,
+
+    /// Expand each watched Proxmox cluster into live SSH stations for every hypervisor
+    /// it hosts (node names/IPs taken from the seed's /etc/pve/nodes roster at startup).
+    #[arg(long)]
+    pve_discover: bool,
 
     /// Render one frame to stdout (plain text, no color) and exit — for scripts, README samples, CI.
     #[arg(long)]
@@ -159,8 +179,23 @@ fn main() -> ExitCode {
         }
     };
 
+    // ---- password file (sshpass): CLI --pass wins over the config `pass` line ----
+    let pass_file = opts
+        .pass
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .or_else(|| file_cfg.pass_file.clone());
+    if let Some(f) = &pass_file {
+        if !std::path::Path::new(f).is_file() {
+            eprintln!("ccc: password file '{f}' does not exist (check --pass / config 'pass')");
+            return ExitCode::from(2);
+        }
+    // (The old sshpass warn-probe became deps::check_launch below: same goal — fail before
+    // six red tabs — but it now offers to INSTALL the tool interactively.)
+    }
+
     // ---- stations: any CLI station flag replaces the config's station lines entirely ----
-    let cli_stations = !opts.hosts.is_empty() || opts.k8s.is_some();
+    let cli_stations = !opts.hosts.is_empty() || opts.k8s.is_some() || !opts.proxmox.is_empty();
     let mut remotes: Vec<app::RemoteSpec> = Vec::new();
     if cli_stations {
         for spec in &opts.hosts {
@@ -186,7 +221,7 @@ fn main() -> ExitCode {
             match collect::split_ssh_tokens(&tokens) {
                 Ok((flags, host)) => {
                     let label = label.unwrap_or_else(|| collect::auto_label(&tokens));
-                    remotes.push(app::RemoteSpec { label, host, ssh_args: flags });
+                    remotes.push(app::RemoteSpec { label, host, ssh_args: flags, pass_file: pass_file.clone() });
                 }
                 Err(e) => {
                     eprintln!("ccc: invalid --host '{spec}': {e}");
@@ -199,7 +234,95 @@ fn main() -> ExitCode {
         // vector minus its label token.
         for (label, tokens, host) in &file_cfg.remotes {
             let args: Vec<String> = tokens.iter().skip(1).cloned().collect();
-            remotes.push(app::RemoteSpec { label: label.clone(), host: host.clone(), ssh_args: args });
+            remotes.push(app::RemoteSpec { label: label.clone(), host: host.clone(), ssh_args: args, pass_file: pass_file.clone() });
+        }
+    }
+
+    // ---- Proxmox specs (one seed connection per cluster) ----
+    let mut pves: Vec<pve::PveSpec> = Vec::new();
+    if cli_stations {
+        for spec in &opts.proxmox {
+            let tokens = match collect::shell_split(spec) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("ccc: invalid --proxmox '{spec}': {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let (label, tokens) = split_label(&tokens);
+            if tokens.is_empty() {
+                eprintln!("ccc: invalid --proxmox '{spec}': no seed host given");
+                return ExitCode::from(2);
+            }
+            match collect::split_ssh_tokens(&tokens) {
+                Ok((flags, host)) => {
+                    let label = label.unwrap_or_else(|| collect::auto_label(&tokens));
+                    pves.push(pve::PveSpec { label, host, ssh_args: flags, pass_file: pass_file.clone() });
+                }
+                Err(e) => {
+                    eprintln!("ccc: invalid --proxmox '{spec}': {e}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+    } else {
+        for (label, tokens, host) in &file_cfg.pves {
+            let args: Vec<String> = tokens.iter().skip(1).cloned().collect();
+            pves.push(pve::PveSpec { label: label.clone(), host: host.clone(), ssh_args: args, pass_file: pass_file.clone() });
+        }
+    }
+
+    // ---- dependency gate (owner request, 2026-10-11): check every external binary this
+    // launch will exec BEFORE spending time connecting. On a terminal we offer to install
+    // through the detected package manager; piped/--once runs get the install command text.
+    // Refusing to start beats a launch whose remote tabs fail at every tick.
+    {
+        let wants_k8s = opts.k8s.is_some() || (!cli_stations && file_cfg.kube_ctx.is_some());
+        let launch_deps = deps::required_bins(
+            !remotes.is_empty() || !pves.is_empty(),
+            pass_file.is_some(),
+            wants_k8s,
+        );
+        if let Err(unresolved) = deps::check_launch(&launch_deps) {
+            eprintln!(
+                "ccc: missing required tool(s): {} — collection would fail on every sample. Install them (see hints above) and re-run.",
+                unresolved.join(", ")
+            );
+            return ExitCode::from(3);
+        }
+    }
+
+    // ---- optional hypervisor discovery: expand clusters into SSH stations ----
+    // One probe connection per cluster reads /etc/pve/nodes (the FUSE cluster roster) and
+    // yields (name, ip) pairs; each becomes a regular -H-style station showing that
+    // node's true OS telemetry (CPU/mem/NET/DISK/GPU). Labels come from PVE's own node
+    // names — the operator's mental map — and collisions skip the station with a warning
+    // (config `ssh node3 …` lines keep priority over discovered ones).
+    if opts.pve_discover || file_cfg.discover_pve {
+        let mut used: Vec<String> = vec![opts.station.clone().or(file_cfg.local_label.clone()).unwrap_or_else(default_station)];
+        used.extend(remotes.iter().map(|r| r.label.clone()));
+        for s in pves.iter() {
+            match pve::discover_nodes(s) {
+                Ok(list) => {
+                    for (name, ip) in list {
+                        if ip.is_empty() {
+                            continue; // offline node without a recorded address: nothing to poll
+                        }
+                        if used.iter().any(|u| *u == name) {
+                            eprintln!("ccc: skipped discovered station '{name}' — label already in use");
+                            continue;
+                        }
+                        used.push(name.clone());
+                        remotes.push(app::RemoteSpec {
+                            label: name,
+                            host: ip,
+                            ssh_args: s.ssh_args.clone(),
+                            pass_file: s.pass_file.clone(),
+                        });
+                    }
+                }
+                Err(e) => eprintln!("ccc: proxmox '{}' node discovery failed: {e}", s.label),
+            }
         }
     }
 
@@ -217,9 +340,11 @@ fn main() -> ExitCode {
     if kube.is_some() {
         tab_names.push(app::fleet_tab_name(&kube, &kube_label));
     }
-    let focus_target = opts.focus.clone().or(if opts.k8s.is_some() {
-        // Launching with --k8s says "I want the fleet": drop straight onto its tab instead
-        // of making the operator press TAB every startup. A --focus flag overrides this.
+    tab_names.extend(pves.iter().map(|p| app::pve_tab_name(&p.label)));
+    let focus_target = opts.focus.clone().or(if opts.k8s.is_some() || !opts.proxmox.is_empty() {
+        // Launching with --k8s/-P says "I want the fleet": drop straight onto its tab instead
+        // of making the operator press TAB every startup. With both kinds, the last fleet
+        // (PVE) wins; an explicit --focus overrides this.
         Some("__FLEET__".to_string())
     } else {
         file_cfg.focus.clone()
@@ -238,6 +363,7 @@ fn main() -> ExitCode {
         remotes,
         kube,
         kube_label,
+        pves,
         focus,
     };
 

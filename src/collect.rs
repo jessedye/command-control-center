@@ -597,6 +597,25 @@ pub fn run_remote_script(
             ("ssh", v)
         }
     };
+    // Connection multiplexing (owner screenshot 2026-10-11): a 9-tab fleet launch opens nine
+    // concurrent handshakes per tick; Proxmox sshd's default MaxStartups (~10 unauthenticated)
+    // drops the surplus with `kex_exchange_identification: Connection closed`. A persisted
+    // control master collapses every sample per host onto ONE connection after the first.
+    // %C hashes host+port+user so no socket name exceeds the 104-char sun_path limit.
+    if let Ok(home) = std::env::var("HOME") {
+        let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_e| "/tmp".to_string());
+        let _ = &dir; // mirrors RemoteCollector::new so every caller shares one master socket per host
+        if std::fs::create_dir_all(&dir).is_ok() {
+            args.extend([
+                "-o".to_string(),
+                "ControlMaster=auto".to_string(),
+                "-o".to_string(),
+                format!("ControlPath={dir}/ccc-ssh-%C"),
+                "-o".to_string(),
+                "ControlPersist=300".to_string(),
+            ]);
+        }
+    }
     // ConnectTimeout applies to ssh in both modes (it rides inside sshpass's ssh argv as a
     // passthrough option because anything after `ssh` below is ssh's argv).
     args.extend([

@@ -301,9 +301,12 @@ fn spawn_samplers(cfg: &Config, tx: SyncSender<Sample>, tick: Duration) -> Vec<t
 
 /// Spread initial samples so N stations don't handshake all at once.
 fn stagger(idx: usize, tick: &Duration) {
-    if idx > 0 {
-        thread::sleep(*tick / 3 * (idx.min(3) as u32));
-    }
+    // Password handshakes are slow (~1-2 s), so a fleet launch firing every station at once
+    // keeps >10 unauthenticated connections alive per sshd and OpenSSH answers kex with
+    // "Not allowed at this time" (observed live 2026-10-11 on the PVE nodes). Space first
+    // contacts ~400 ms apart; ControlMaster persists the master after that, so steady state
+    // opens no new sockets. Cap keeps a huge roster from starving late tabs for minutes.
+    thread::sleep((*tick / 5).min(Duration::from_millis(700)) * idx as u32);
 }
 
 fn sleep_until(at: Instant) {

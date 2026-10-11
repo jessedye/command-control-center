@@ -752,9 +752,10 @@ fn fleet_chips(view: &View) -> Vec<Row> {
             (None, Some(e)) => (St::Crit, trunc_cell(e, 40)),
             (None, None) => (St::Dim, "awaiting first sample…".to_string()),
         };
+        // No [o]/[X] lamp here (owner, 2026-10-11): the tab strip and tail already carry
+        // status through color; bracketed letters added noise to every row. Rail gauges keep theirs.
         rows.push(vec![
             seg(format!("[{}] ", i + 1), St::Dim),
-            seg(lamp(lamp_st), lamp_st),
             seg(format!("{:<14}", trunc_cell(&s.title(), 14)), if i == view.focus { St::Ident } else { St::Normal }),
             seg(tail, lamp_st),
         ]);

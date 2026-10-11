@@ -5,11 +5,10 @@ disks, network, and top processes as readable ASCII gauges — local box, remote
 plain SSH, and Kubernetes node fleets via `kubectl`. One static binary on your side; nothing
 to install on theirs.
 
-![ccc dashboard](docs/screenshot.png)
+Tabbing through a live 12-station fleet — Overview board, station detail panels with per-station
+top processes, and DGX Spark nodes showing unified-memory NVRAM:
 
-Kubernetes fleet tab — node CPU/MEM heat bars from `kubectl top`, live per-container pod ranking, and persistent-volume inventory:
-
-![Kubernetes fleet tab](docs/screenshot-k8s.png)
+![Tabbing through the ccc dashboard](docs/demo.gif)
 
 ## Why
 
@@ -71,6 +70,11 @@ CONF
 
 ccc                           # tabs along the top: fedora · rack4 · K8S:homelab
 ```
+
+Ready-to-copy annotated configs for common setups live in
+[docs/examples/](docs/examples/) — a minimal two-box fleet, a mixed homelab (SSH + Kubernetes),
+GPU boxes with unified-memory NVRAM, and a Proxmox cluster seed. All addresses use RFC 5737
+documentation ranges; swap in your own hosts.
 
 Ad-hoc runs use flags; any `-H`/`--k8s` replaces the config's stations wholesale so a
 one-off invocation can't silently merge into your daily fleet:

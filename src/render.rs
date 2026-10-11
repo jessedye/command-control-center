@@ -177,6 +177,11 @@ pub const BANNER: [&str; 5] = [
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Label of the dedicated fleet-summary tab (owner directive 2026-10-11). app.rs inserts
+/// a slot with this name at index 0 in SummaryMode::Overview; render.rs gates chip panels
+/// and header text on it. Keep in sync with config's `summary` values.
+pub const OVERVIEW_LABEL: &str = "overview";
+
 /// Everything the renderer needs for one frame.
 pub struct View<'a> {
     pub clock: String,
@@ -185,6 +190,8 @@ pub struct View<'a> {
     pub spin: char,
     pub stations: Vec<UiStation<'a>>,
     pub focus: usize,
+    /// Where the fleet summary chips belong (config `summary overview|all|off`).
+    pub summary: crate::config::SummaryMode,
     pub sort_label: &'static str,
     pub top: usize,
     pub verbose: bool,
@@ -199,6 +206,8 @@ pub struct UiStation<'a> {
     pub label: String,
     pub host: Option<&'a Station>,
     pub err: Option<String>,
+    /// Proxmox cluster view on PVE slots; None on host/k8s slots.
+    pub pve: Option<&'a crate::snapshot::PveCluster>,
     pub kube: Option<&'a [KubeNode]>,
     /// Container usage rows and PVC claims from the same fleet poll (empty when unavailable).
     pub kube_pods: &'a [KubePod],
@@ -253,13 +262,33 @@ fn header_rows(view: &View) -> Vec<Row> {
     // Fleet slots have no Station/HostInfo, so they previously rendered the same
     // "NO TELEMETRY / station offline" pair as a dead link — while the panel below was
     // demonstrably full of live node rows. Give them their own meta line.
+    // The Overview tab has no host of its own; say what it aggregates instead of "NO TELEMETRY".
+    let fleet_count = view.stations.iter().filter(|s| s.label != OVERVIEW_LABEL).count();
     let meta = cur
+        .filter(|s| s.label != OVERVIEW_LABEL)
         .and_then(|s| s.host)
         .map(|h| format!("UP {} · LOAD {:.1} {:.1} {:.1}", format::fmt_uptime(h.uptime_s), h.load[0], h.load[1], h.load[2]))
         .or_else(|| {
+            if cur.is_some_and(|s| s.label == OVERVIEW_LABEL) && fleet_count > 0 {
+                return Some(format!(
+                    "{fleet_count} STATION{} AGGREGATED",
+                    if fleet_count == 1 { "" } else { "S" }
+                ));
+            }
             cur.and_then(|s| s.kube).map(|k| {
                 let ready = k.iter().filter(|n| kube_ready(&n.status)).count();
                 format!("FLEET ONLINE · {ready}/{} NODES READY", k.len())
+            })
+        })
+        .or_else(|| {
+            cur.and_then(|s| s.pve).map(|c| {
+                let online = c.nodes.iter().filter(|n| n.online).count();
+                let running = c.guests.iter().filter(|g| g.status == "running").count();
+                format!(
+                    "PVE CLUSTER · {online}/{} NODES ONLINE · {running}/{} GUESTS RUNNING",
+                    c.nodes.len(),
+                    c.guests.len()
+                )
             })
         })
         .unwrap_or_else(|| "NO TELEMETRY".to_string());
@@ -312,13 +341,31 @@ fn header_rows(view: &View) -> Vec<Row> {
                 .map(|h| vec![seg(trunc_cell(&h.os_name, 28), St::Dim), seg(" · kernel ", St::Rule), seg(trunc_cell(&h.kernel, 22), St::Dim)])
                 // Fleet slots report their data source where a host row shows OS/kernel;
                 // "station offline" is reserved for slots with neither.
-                .unwrap_or_else(|| match cur.and_then(|s| s.kube) {
-                    Some(k) => vec![
-                        seg("kubectl fleet", St::Dim),
-                        seg(" · ", St::Rule),
-                        seg(format!("{} node{} via kubeconfig", k.len(), if k.len() == 1 { "" } else { "s" }), St::Dim),
-                    ],
-                    None => vec![seg("station offline".to_string(), St::Warn)],
+                .unwrap_or_else(|| {
+                    if cur.is_some_and(|s| s.label == OVERVIEW_LABEL) {
+                        return vec![seg(
+                            format!("all stations · TAB/1..{} to drill in", fleet_count),
+                            St::Dim,
+                        )];
+                    }
+                    if let Some(k) = cur.and_then(|s| s.kube) {
+                        vec![
+                            seg("kubectl fleet", St::Dim),
+                            seg(" · ", St::Rule),
+                            seg(format!("{} node{} via kubeconfig", k.len(), if k.len() == 1 { "" } else { "s" }), St::Dim),
+                        ]
+                    } else if let Some(c) = cur.and_then(|s| s.pve) {
+                        vec![
+                            seg("proxmox cluster", St::Dim),
+                            seg(" · ", St::Rule),
+                            seg(
+                                format!("{} hypervisor{} via pvesh", c.nodes.len(), if c.nodes.len() == 1 { "" } else { "s" }),
+                                St::Dim,
+                            ),
+                        ]
+                    } else {
+                        vec![seg("station offline".to_string(), St::Warn)]
+                    }
                 }),
             4 => vec![seg(view.clock.clone(), St::Dim), seg("  ", St::Normal), seg(format!("[{}] SAMPLE", view.spin), St::Ident)],
             _ => vec![],
@@ -342,15 +389,27 @@ fn header_rows(view: &View) -> Vec<Row> {
         // Fleet slots roll up `kubectl top` usage-vs-allocatable; nodes without a metric are
         // skipped so metrics-server gaps can't read as 0%. NVRAM/DISK are concepts a fleet
         // does not have — showing 0% there is noise (and reads as "all nodes at zero").
-        let mut rails: Vec<(&str, f64)> = match s.kube {
-            Some(k) => {
+        // PVE slots use the same two-rail vocabulary from hypervisor data: CPU = mean of
+        // ONLINE nodes' cpu %; MEM = total used bytes over total capacity (offline nodes
+        // contribute nothing — counting their RAM as free would lie both ways).
+        let mut rails: Vec<(&str, f64)> = match (s.kube, s.pve) {
+            (Some(k), _) => {
                 let avg = |get: fn(&KubeNode) -> Option<f32>| -> f64 {
                     let v: Vec<f64> = k.iter().filter_map(get).map(f64::from).collect();
                     if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 }
                 };
                 vec![("CPU", avg(|n| n.cpu_pct)), ("MEM", avg(|n| n.mem_pct))]
             }
-            None => host_rails.clone(),
+            (None, Some(c)) => {
+                let online: Vec<&crate::snapshot::PveNode> = c.nodes.iter().filter(|n| n.online).collect();
+                let cpus: Vec<f64> = online.iter().filter_map(|n| n.cpu_pct).collect();
+                let cpu_avg = if cpus.is_empty() { 0.0 } else { cpus.iter().sum::<f64>() / cpus.len() as f64 };
+                let used: u64 = online.iter().map(|n| n.mem_bytes).sum();
+                let total: u64 = online.iter().map(|n| n.max_mem_bytes).sum();
+                let mem = crate::snapshot::pct_of(used, total);
+                vec![("CPU", cpu_avg), ("MEM", mem)]
+            }
+            (None, None) => host_rails.clone(),
         };
         // Full bars at >= 40 columns; pure numbers under 40 (bar+brackets+label need ~21
         // cells to stay readable and not eat the title). Below 24 nothing fits at all.
@@ -375,6 +434,14 @@ fn header_rows(view: &View) -> Vec<Row> {
             append_right_aligned(
                 &mut rows[0],
                 &[seg(format!("NODES {ready}/{}", k.len()), St::Ident)],
+                w,
+            );
+        }
+        if let Some(c) = s.pve {
+            let online = c.nodes.iter().filter(|n| n.online).count();
+            append_right_aligned(
+                &mut rows[0],
+                &[seg(format!("PVE {online}/{}", c.nodes.len()), St::Ident)],
                 w,
             );
         }
@@ -672,11 +739,14 @@ fn disk_panel(view: &View, h: &Station, max_rows: usize) -> Vec<Row> {
     rows
 }
 
-fn fleet_chips(view: &View) -> Vec<Row> {
+/// Compact per-station strip. `with_disk` adds a disk-max cell (the Overview tab is the
+/// one place all "important stats" belong per owner 2026-10-11). The overview slot itself
+/// never gets a chip — it has no telemetry of its own, only the fleet's.
+fn fleet_chips(view: &View, with_disk: bool) -> Vec<Row> {
     let mut rows = Vec::new();
     for (i, s) in view.stations.iter().enumerate() {
-        if s.kube.is_some() {
-            continue; // rendered by kube_table
+        if s.kube.is_some() || s.label == OVERVIEW_LABEL {
+            continue; // k8s rows belong to kube_table; the overview tab has no telemetry of its own
         }
         let (lamp_st, tail) = match (s.host, &s.err) {
             // Stale-but-readable station: keep the numbers, stamp the fault (#6).
@@ -696,25 +766,269 @@ fn fleet_chips(view: &View) -> Vec<Row> {
             (Some(h), None) => {
                 let l = sev_of((h.cpu_avg_pct as f64).max(h.mem_pct()), view.warn, view.crit);
                 let nv = gpu_avg_pct(h);
-                (
-                    l,
-                    format!(
-                        "cpu {:>4.0}%  mem {:>4.0}%  nvram {:>4.0}%  load {:.1}",
-                        h.cpu_avg_pct, h.mem_pct(), nv, h.load[0]
-                    ),
-                )
+                let mut tail = format!(
+                    "cpu {:>4.0}%  mem {:>4.0}%  nvram {:>4.0}%  load {:.1}",
+                    h.cpu_avg_pct, h.mem_pct(), nv, h.load[0]
+                );
+                if with_disk {
+                    // Overview tab is the consolidated dashboard owner asked for: one
+                    // glance needs disk too, not just cpu/mem/nvram/load.
+                    tail.push_str(&format!("  disk {:>4.0}%", disk_max_pct(h)));
+                }
+                (l, tail)
             }
             (None, Some(e)) => (St::Crit, trunc_cell(e, 40)),
-            (None, None) => (St::Dim, "awaiting first sample…".to_string()),
+            (None, None) => match s.pve {
+                // A live PVE slot has no Station host — say what it IS instead of the
+                // misleading "awaiting first sample…" a bare arm would print (owner saw
+                // "[9] PVE:lab awaiting" while the cluster tab streamed data).
+                Some(c) => {
+                    let online = c.nodes.iter().filter(|n| n.online).count();
+                    let running = c.guests.iter().filter(|g| g.status == "running").count();
+                    (
+                        if online == c.nodes.len() { St::Ok } else { St::Warn },
+                        format!(
+                            "{online}/{} hypervisor{} online · {running}/{} guests",
+                            c.nodes.len(),
+                            if c.nodes.len() == 1 { "" } else { "s" },
+                            c.guests.len()
+                        ),
+                    )
+                }
+                None => (St::Dim, "awaiting first sample…".to_string()),
+            },
         };
+        // No [o]/[X] lamp here (owner, 2026-10-11): the tab strip and tail already carry
+        // status through color; bracketed letters added noise to every row. Rail gauges keep theirs.
         rows.push(vec![
             seg(format!("[{}] ", i + 1), St::Dim),
-            seg(lamp(lamp_st), lamp_st),
             seg(format!("{:<14}", trunc_cell(&s.title(), 14)), if i == view.focus { St::Ident } else { St::Normal }),
             seg(tail, lamp_st),
         ]);
     }
     rows
+}
+
+/// Proxmox cluster panel: hypervisor nodes, guest VM/CT inventory, storage usage and the
+/// Ceph health summary. Focused-slot only (same rule as kube_table — the fedora tab must
+/// not paint proxmox tables above its local gauges).
+fn pve_table(view: &View) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let Some(st) = view.stations.get(view.focus.min(view.stations.len().saturating_sub(1))) else {
+        return rows;
+    };
+    let Some(cluster) = st.pve else { return rows };
+
+    // ---- PVE NODES: hypervisor hardware, inline heat bars like the k8s table ----
+    if !cluster.nodes.is_empty() {
+        rows.push(vec![seg(
+            format!("{:<14} {:<7} {:<15} {:<14} {:>6} {:<14}", "PVE NODE", "STATUS", "IP", "CPU", "CORES", "MEM"),
+            St::Head,
+        )]);
+        // A 40-node cluster would eat the screen: running capacity first is more useful
+        // than alphabetical — online nodes sorted by CPU load descending.
+        let mut nodes: Vec<&crate::snapshot::PveNode> = cluster.nodes.iter().collect();
+        nodes.sort_by(|a, b| {
+            b.online.cmp(&a.online).then_with(|| b.cpu_pct.unwrap_or(0.0).total_cmp(&a.cpu_pct.unwrap_or(0.0)))
+        });
+        for n in nodes.into_iter().take(if view.verbose { 64 } else { 12 }) {
+            let stt = if n.online { St::Ok } else { St::Crit };
+            // One 14-cell metric column: bar(9) + right-aligned percent, same contract as
+            // kube_table's cells ({:>3}% keeps 1..=100 aligned against {:<14} headers).
+            let cell = |p: Option<f64>| -> (String, St) {
+                match p {
+                    Some(v) => (
+                        format!("{:<14}", format!("{} {:>3}%", bar(v, 9), v.round())),
+                        sev_sym(v, view),
+                    ),
+                    None => (format!("{:<14}", "-"), St::Dim),
+                }
+            };
+            let (cpu_s, cpu_c) = cell(n.cpu_pct);
+            // Node memory % is computed from bytes here (pvesh gives GiB usage/total).
+            let mem_pct = if n.max_mem_bytes > 0 {
+                Some(100.0 * n.mem_bytes as f64 / n.max_mem_bytes as f64)
+            } else {
+                None
+            };
+            let (mem_s, mem_c) = cell(mem_pct);
+            rows.push(vec![
+                seg(format!("{:<14} ", trunc_cell(&n.name, 14)), St::Normal),
+                seg(format!("{:<7} ", trunc_cell(if n.online { "online" } else { "OFFLINE" }, 7)), stt),
+                seg(format!("{:<15} ", trunc_cell(&n.ip, 15)), St::Dim),
+                seg(format!("{cpu_s} "), cpu_c),
+                seg(format!("{:>6} ", if n.max_cpu > 0 { format!("{}c", n.max_cpu) } else { "-".into() }), St::Dim),
+                seg(mem_s, mem_c),
+                seg(format!(" up {}", format::fmt_uptime(n.uptime_s)), St::Dim),
+            ]);
+        }
+    }
+
+    // ---- GUESTS: VMs and containers, ranked like TOP PROCS ----
+    if !cluster.guests.is_empty() {
+        rows.push(vec![seg(String::new(), St::Dim)]);
+        let mut guests: Vec<&crate::snapshot::PveGuest> = cluster.guests.iter().collect();
+        // Running first, then hottest CPU: a stopped template never outranks a busy VM.
+        guests.sort_by(|a, b| {
+            let ra = if a.status == "running" { 1u8 } else { 0 };
+            let rb = if b.status == "running" { 1u8 } else { 0 };
+            rb.cmp(&ra).then_with(|| {
+                b.cpu_pct.unwrap_or(0.0).total_cmp(&a.cpu_pct.unwrap_or(0.0))
+            })
+        });
+        let running = cluster.guests.iter().filter(|g| g.status == "running").count();
+        rows.push(vec![seg(
+            format!(
+                "GUESTS · {} of {} running (bar: % of own cores)",
+                running,
+                cluster.guests.len()
+            ),
+            St::Head,
+        )]);
+        rows.push(vec![seg(
+            format!("{:>4} {:<5} {:<24} {:<7} {:<12} {:>4} {:>9}", "VMID", "TYPE", "NAME", "NODE", "CPU", "CORES", "MEM"),
+            St::Head,
+        )]);
+        let cap = if view.verbose { 32 } else { 10 };
+        let max_share = guests.iter().filter_map(|g| g.cpu_pct).fold(0.0f64, f64::max);
+        for g in guests.into_iter().take(cap) {
+            let stat = match g.status.as_str() {
+                "running" => St::Ok,
+                "stopped" => St::Dim,
+                "" => St::Dim,
+                _ => St::Warn, // paused, migrating, backup-suspended… worth attention
+            };
+            let share = g.cpu_pct.map(|p| (p / max_share.max(f64::EPSILON) * 100.0).clamp(1.0, 100.0));
+            let bar_s = match share {
+                Some(s) => seg(bar(s, 10), sev_sym(s, view)),
+                None => seg(" ".repeat(10), St::Dim),
+            };
+            rows.push(vec![
+                seg(format!("{:>4} ", g.vmid), St::Normal),
+                seg(format!("{:<5} ", if g.kind == "lxc" { "lxc" } else { "qemu" }), St::Dim),
+                seg(
+                    format!("{:<24} ", format!("{}{}", trunc_cell(&g.name, 23 - usize::from(g.template)), if g.template { " T" } else { "" })),
+                    if g.template { St::Dim } else { St::Normal },
+                ),
+                seg(format!("{:<7} ", trunc_cell(&g.node, 7)), St::Dim),
+                bar_s,
+                seg(
+                    format!(" {:>3} ", if g.max_cpu > 0 { g.max_cpu.to_string() } else { "-".into() }),
+                    St::Dim,
+                ),
+                seg(
+                    format!("{:>9}", format::fmt_bytes(g.mem_bytes)),
+                    St::Dim,
+                ),
+                seg(format!(" {:<7}", trunc_cell(&g.status, 7)), stat),
+            ]);
+        }
+    }
+
+    // ---- STORAGE: NFS, dirs, LVM-thin, CephFS/RBD — every storage the nodes mount ----
+    if !cluster.storage.is_empty() {
+        rows.push(vec![seg(String::new(), St::Dim)]);
+        let mut stor: Vec<&crate::snapshot::PveStorage> = cluster.storage.iter().collect();
+        // Hottest volume first: the operator cares about the pool that is filling up.
+        stor.sort_by(|a, b| b.used_pct.unwrap_or(-1.0).total_cmp(&a.used_pct.unwrap_or(-1.0)));
+        rows.push(vec![seg(
+            format!("STORAGE · {} volumes · bar: % full (per-node view)", stor.len()),
+            St::Head,
+        )]);
+        rows.push(vec![seg(
+            format!("{:<7} {:<14} {:<8} {:<12} {:>6} {:>10} {:>10}", "NODE", "NAME", "TYPE", "USE", "%FULL", "USED", "AVAIL"),
+            St::Head,
+        )]);
+        // Capacity pin: a huge low-percentage volume (the 1.26 TiB CephFS sits at ~3.8% full)
+        // falls off a hottest-first cut, and the owner explicitly wants cephfs/NFS usage
+        // visible — so append the two largest volumes that didn't make the heat cut.
+        let heat_cap = if view.verbose { 40 } else { 10 };
+        let pinned = if view.verbose { 0 } else { 2 };
+        let mut shown: Vec<&crate::snapshot::PveStorage> = stor.iter().copied().take(heat_cap).collect();
+        let mut rest = stor.split_off(heat_cap.min(stor.len()));
+        rest.sort_by_key(|s| std::cmp::Reverse(s.total_bytes));
+        shown.extend(rest.into_iter().take(pinned));
+        for s in shown {
+            let stt = match s.used_pct {
+                Some(p) => sev_sym(p, view),
+                None => St::Dim,
+            };
+            rows.push(vec![
+                seg(format!("{:<7} ", trunc_cell(&s.node, 7)), St::Dim),
+                seg(format!("{:<14} ", trunc_cell(&s.name, 14)), St::Normal),
+                seg(format!("{:<8} ", trunc_cell(&s.kind, 8)), St::Dim),
+                match s.used_pct {
+                    Some(p) => seg(bar(p, 10), stt),
+                    None => seg("-".repeat(10), St::Dim),
+                },
+                seg(
+                    format!(" {:>5}%", s.used_pct.map(|p| p.round()).unwrap_or_default()),
+                    stt,
+                ),
+                seg(format!(" {:>9}", format::fmt_bytes(s.used_bytes)), St::Dim),
+                seg(format!(" {:>9}", format::fmt_bytes(s.avail_bytes)), St::Dim),
+            ]);
+        }
+    }
+
+    // ---- Ceph health: one line, colored honestly ----
+    if let Some(h) = &cluster.ceph_health {
+        let st = ceph_st(h);
+        rows.push(vec![
+            seg("CEPH  ", St::Head),
+            seg(format!("health {h}"), st),
+        ]);
+    }
+
+    // Collection notes (no pvesh, API failures…) — small, dim, capped.
+    for note in cluster.notes.iter().take(if view.verbose { 8 } else { 3 }) {
+        rows.push(vec![seg(format!("       {}", trunc_cell(note, 90)), St::Dim)]);
+    }
+    rows
+}
+
+/// Map a Ceph overall_status string onto lamp colors: anything not OK-ish is a problem.
+pub fn ceph_st(status: &str) -> St {
+    match status.trim().to_ascii_uppercase().as_str() {
+        "OK" | "HEALTH_OK" => St::Ok,
+        "WARN" | "HEALTH_WARN" | "WARNING" => St::Warn,
+        _ => St::Crit, // HEALTH_ERR, AVAILABILITY, unavailable strings…
+    }
+}
+
+/// Machine-readable PVE alerts (offline hypervisors, full storage volumes, sick Ceph)
+/// shared by alert_lines and alert_count so they can never disagree (round-2 pattern).
+fn pve_alerts(view: &View, warn: f64) -> Vec<(St, String)> {
+    let mut out = Vec::new();
+    for s in &view.stations {
+        let Some(c) = s.pve else { continue };
+        for n in c.nodes.iter().filter(|n| !n.online) {
+            out.push((St::Crit, format!("PVE NODE {} OFFLINE", n.name)));
+        }
+        for g in c.guests.iter().filter(|g| g.status == "paused") {
+            out.push((St::Warn, format!("GUEST {} {} PAUSED", g.vmid, g.name)));
+        }
+        for st in &c.storage {
+            // Only judge volumes we can measure; skip tiny sub-GiB scratch mounts.
+            if st.total_bytes >= 1 << 30 {
+                if let Some(p) = st.used_pct {
+                    if p >= warn {
+                        out.push((
+                            sev_sym(p, view),
+                            format!("STORAGE {}/{} {:.0}% FULL ({} free)", st.node, st.name, p, format::fmt_bytes(st.avail_bytes)),
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(h) = &c.ceph_health {
+            let st = ceph_st(h);
+            if st != St::Ok {
+                out.push((st, format!("CEPH HEALTH {h}")));
+            }
+        }
+    }
+    out
 }
 
 fn kube_table(view: &View) -> Vec<Row> {
@@ -927,6 +1241,8 @@ pub fn alert_lines(view: &View) -> Vec<Row> {
             }
         }
     }
+    // Proxmox alarms share the crit-first sort below; one source list feeds lines AND count.
+    alerts.extend(pve_alerts(view, view.warn));
     alerts.sort_by_key(|(s, _)| match s { St::Crit => 0, St::Warn => 1, _ => 2 });
     let mut rows = Vec::new();
     for (st, msg) in alerts.iter().take(2) {
@@ -959,6 +1275,7 @@ pub fn alert_count(view: &View) -> usize {
             n += nodes.iter().filter(|n| !kube_ready(&n.status)).count();
         }
     }
+    n += pve_alerts(view, view.warn).len();
     n
 }
 
@@ -1044,12 +1361,24 @@ pub fn build_rows(view: &View) -> Vec<Row> {
     let hist_mem: &[f64] = &focus.hist_mem;
     let multi = view.stations.iter().filter(|s| s.host.is_some()).count() > 1;
 
-    if view.stations.len() > 1 {
-        for r in fleet_chips(view) {
+    // Fleet summary placement (owner directive 2026-10-11): `overview` mode lives on its
+    // own tab so every station page is pure detail; `all` keeps the legacy strip on every
+    // multi-station tab. The overview tab carries the disk column (consolidated dashboard).
+    let focusing_overview = view.stations.get(view.focus).is_some_and(|s| s.label == OVERVIEW_LABEL);
+    let show_chips = match view.summary {
+        crate::config::SummaryMode::Off => false,
+        crate::config::SummaryMode::All => view.stations.len() > 1,
+        crate::config::SummaryMode::Overview => view.stations.len() > 1 && focusing_overview,
+    };
+    if show_chips {
+        for r in fleet_chips(view, focusing_overview) {
             out.push((P_CHIP, false, r));
         }
     }
     for (i, r) in kube_table(view).into_iter().enumerate() {
+        out.push((if i == 0 { P_STRUCT } else { P_KUBE_ROW }, i == 0, r));
+    }
+    for (i, r) in pve_table(view).into_iter().enumerate() {
         out.push((if i == 0 { P_STRUCT } else { P_KUBE_ROW }, i == 0, r));
     }
     match (station, focus.err.as_deref()) {
@@ -1262,6 +1591,7 @@ mod fleet_render_tests {
                 label: "K8S:test".into(),
                 host: None,
                 err: None,
+                pve: None,
                 kube: Some(nodes),
                 kube_pods: pods,
                 kube_pvcs: pvcs,
@@ -1271,6 +1601,7 @@ mod fleet_render_tests {
                 sample_ts: 0,
             }],
             focus: 0,
+            summary: crate::config::SummaryMode::All,
             sort_label: "CPU",
             top: 10,
             verbose: false,
@@ -1358,6 +1689,7 @@ mod fleet_render_tests {
                     label: "fedora".into(),
                     host: Some(&host),
                     err: None,
+                    pve: None,
                     kube: None,
                     kube_pods: &[],
                     kube_pvcs: &[],
@@ -1370,6 +1702,7 @@ mod fleet_render_tests {
                     label: "K8S:homelab".into(),
                     host: None,
                     err: None,
+                    pve: None,
                     kube: Some(&nodes),
                     kube_pods: &pods,
                     kube_pvcs: &pvcs,
@@ -1380,6 +1713,7 @@ mod fleet_render_tests {
                 },
             ],
             focus,
+            summary: crate::config::SummaryMode::All,
             sort_label: "CPU",
             top: 10,
             verbose: false,
@@ -1397,6 +1731,130 @@ mod fleet_render_tests {
         assert!(!on_host.contains("k3s-agent-00"), "no node rows leak: {on_host}");
         let on_fleet = to_plain(&build_rows(&build(1))).join("\n");
         assert!(on_fleet.contains("FLEET ") && on_fleet.contains("TOP PODS") && on_fleet.contains("PVC ·"), "fleet tab keeps its panels: {on_fleet}");
+    }
+
+    fn pve_fixture() -> crate::snapshot::PveCluster {
+        use crate::snapshot::{PveGuest, PveNode, PveStorage};
+        crate::snapshot::PveCluster {
+            nodes: vec![
+                PveNode { name: "node1".into(), ip: "192.0.2.241".into(), online: true, cpu_pct: Some(23.06), max_cpu: 12, mem_bytes: (39.34 * 1024f64.powi(3)) as u64, max_mem_bytes: (62.48 * 1024f64.powi(3)) as u64, uptime_s: 370_000 },
+                PveNode { name: "node5".into(), ip: "192.0.2.245".into(), online: false, cpu_pct: None, max_cpu: 16, mem_bytes: 0, max_mem_bytes: 0, uptime_s: 0 },
+            ],
+            guests: vec![
+                PveGuest { vmid: 101, kind: "qemu".into(), name: "k3s-agent-02".into(), node: "node3".into(), status: "running".into(), template: false, cpu_pct: Some(29.3), max_cpu: 8, mem_bytes: 32 << 30, max_mem_bytes: 32 << 30 },
+                PveGuest { vmid: 100, kind: "qemu".into(), name: "template-vm-rhel10".into(), node: "node1".into(), status: "stopped".into(), template: true, cpu_pct: Some(0.0), max_cpu: 4, mem_bytes: 0, max_mem_bytes: 8 << 30 },
+            ],
+            storage: vec![
+                PveStorage { node: "node1".into(), name: "nfs-backup".into(), kind: "nfs".into(), content: "backup,vztmpl,iso".into(), total_bytes: 67 << 30, avail_bytes: 60 << 30, used_bytes: 4 << 30, used_pct: Some(6.28) },
+                PveStorage { node: "node1".into(), name: "ceph_pool01".into(), kind: "rbd".into(), content: "rootdir,images".into(), total_bytes: 2 << 40, avail_bytes: 933 << 20, used_bytes: (1.02 * 1024f64.powi(4)) as u64, used_pct: Some(52.82) },
+            ],
+            ceph_health: Some("HEALTH_WARN".into()),
+            notes: vec!["quorum OK".into()],
+        }
+    }
+
+    #[test]
+    fn pve_panel_renders_nodes_guests_storage_ceph() {
+        let c = pve_fixture();
+        let view = View {
+            clock: "00:00:00Z".into(),
+            epoch: 0,
+            spin: '*',
+            stations: vec![UiStation {
+                label: "PVE:lab".into(),
+                host: None,
+                err: None,
+                pve: Some(&c),
+                kube: None,
+                kube_pods: &[],
+                kube_pvcs: &[],
+                kube_note: None,
+                hist_cpu: Vec::new(),
+                hist_mem: Vec::new(),
+                sample_ts: 0,
+            }],
+            focus: 0,
+            summary: crate::config::SummaryMode::All,
+            sort_label: "CPU",
+            top: 10,
+            verbose: false,
+            paused: false,
+            warn: 60.0,
+            crit: 85.0,
+            width: 150,
+            height: 50,
+        };
+        let text = to_plain(&build_rows(&view)).join("\n");
+        // Header meta + chip come from cluster rollup.
+        assert!(text.contains("PVE CLUSTER · 1/2 NODES ONLINE · 1/2 GUESTS RUNNING"), "{text}");
+        assert!(text.contains("PVE 1/2"), "top-right chip: {text}");
+        // Node rows with bars; offline node flagged in caps.
+        assert!(text.contains("node1") && text.contains("192.0.2.241"), "node row: {text}");
+        assert!(text.contains("OFFLINE"), "offline node shouts: {text}");
+        // Guests ranked; the hot VM before the stopped template.
+        assert!(text.contains("GUESTS · 1 of 2 running"), "{text}");
+        let i_agent = text.find("k3s-agent-02").expect("guest row");
+        let i_tpl = text.find("template-vm-rhel10").expect("template row");
+        assert!(i_agent < i_tpl, "running-first ordering: {text}");
+        assert!(text.contains(" T"), "template marker: {text}");
+        // Storage sorted by fill; the 52.8% pool above the 6.3% NFS mount.
+        assert!(text.contains("STORAGE · 2 volumes"), "{text}");
+        assert!(text.contains("ceph_pool01") && text.contains("53%"), "{text}");
+        assert!(text.contains("nfs-backup") && text.contains("6%"), "{text}");
+        let i_pool = text.find("ceph_pool01").unwrap();
+        let i_nfs = text.find("nfs-backup").unwrap();
+        assert!(i_pool < i_nfs, "hottest volume first");
+        // Ceph health shown verbatim and red for non-OK.
+        assert!(text.contains("health HEALTH_WARN"), "{text}");
+        assert!(text.contains("CEPH HEALTH HEALTH_WARN"), "alert raised: {text}");
+        // Collection note rendered.
+        assert!(text.contains("quorum OK"), "{text}");
+    }
+
+    #[test]
+    fn pve_panels_stay_on_the_pve_tab() {
+        // Companion of fleet_panels_stay_on_the_fleet_tab: with three tabs open, the
+        // hypervisor tables must render ONLY when the PVE slot is focused.
+        let c = pve_fixture();
+        let host = host_station();
+        let build = |focus: usize| View {
+            clock: "00:00:00Z".into(),
+            epoch: 0,
+            spin: '*',
+            stations: vec![
+                UiStation { label: "fedora".into(), host: Some(&host), err: None, pve: None, kube: None, kube_pods: &[], kube_pvcs: &[], kube_note: None, hist_cpu: Vec::new(), hist_mem: Vec::new(), sample_ts: 0 },
+                UiStation { label: "PVE:lab".into(), host: None, err: None, pve: Some(&c), kube: None, kube_pods: &[], kube_pvcs: &[], kube_note: None, hist_cpu: Vec::new(), hist_mem: Vec::new(), sample_ts: 0 },
+            ],
+            focus,
+            summary: crate::config::SummaryMode::All,
+            sort_label: "CPU",
+            top: 10,
+            verbose: false,
+            paused: false,
+            warn: 60.0,
+            crit: 85.0,
+            width: 150,
+            height: 50,
+        };
+        let on_host = to_plain(&build_rows(&build(0))).join("\n");
+        // The GLOBAL alert banner legitimately names PVE nodes on any tab ("ALERT PVE NODE
+        // node5 OFFLINE") — that's cross-fleet awareness, not the fleet panel. Assert on the
+        // panel's own column header, which only exists in pve_table's output.
+        assert!(!on_host.contains("PVE NODE    STATUS"), "no hypervisor TABLE on host tab: {on_host}");
+        assert!(!on_host.contains("GUESTS ·"), "no guest table on host tab");
+        assert!(!on_host.contains("STORAGE ·"), "no storage table on host tab");
+        // (No ceph-panel assertion here: the GLOBAL alert banner prints "CEPH HEALTH …"
+        // on every tab by design; pve_panel_renders… covers the panel's own presence.)
+        let on_pve = to_plain(&build_rows(&build(1))).join("\n");
+        assert!(on_pve.contains("PVE NODE") && on_pve.contains("GUESTS ·"), "pve tab keeps panels");
+    }
+
+    #[test]
+    fn ceph_status_colors() {
+        assert_eq!(crate::render::ceph_st("OK"), St::Ok);
+        assert_eq!(crate::render::ceph_st("HEALTH_OK"), St::Ok);
+        assert_eq!(crate::render::ceph_st("HEALTH_WARN"), St::Warn);
+        assert_eq!(crate::render::ceph_st("HEALTH_ERR"), St::Crit);
     }
 
     #[test]

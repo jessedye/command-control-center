@@ -43,7 +43,12 @@ jobs:
           busybox sh -n assets/collector.sh
           busybox sh assets/collector.sh | head -n 3
       - name: shellcheck
-        uses: koalayder/actions-shellcheck-Action@v5
+        # Direct invocation — koalayder/actions-shellcheck-Action@v5 became unresolvable
+        # (repository deleted from GitHub) on 2026-10-11, failing Set up job before any
+        # step ran. Advisory lint stays advisory via continue-on-error.
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck -s sh assets/collector.sh
         continue-on-error: true
 
   # The CLI contract tested by tests/cli.rs, exercised on the real release binary.
@@ -57,6 +62,12 @@ jobs:
       - run: ./target/release/ccc --version
       - run: ./target/release/ccc --once --width 96 --height 36 --no-color
       - name: malformed arguments must exit 2, not panic
+        # The old `cmd; test $? -eq 2` form could never pass: under bash -e the shell
+        # exits on the expected non-zero code BEFORE test runs, so the step died with
+        # "Process completed with exit code 2" — the very behavior under test.
         run: |
-          ./target/release/ccc --interval NaN --once; test $? -eq 2
-          ./target/release/ccc -H 'box=-p' --once; test $? -eq 2
+          r1=0; ./target/release/ccc --interval NaN --once >/dev/null 2>&1 || r1=$?
+          r2=0; ./target/release/ccc -H 'box=-p' --once >/dev/null 2>&1 || r2=$?
+          if [ "$r1" = 2 ] && [ "$r2" = 2 ]; then exit 0; fi
+          echo "expected exit 2; got interval-NaN=$r1 bad-spec=$r2"
+          exit 1

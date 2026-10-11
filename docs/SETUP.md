@@ -40,7 +40,7 @@ ccc --once --no-color > state.txt     # plain text, single frame, exit 0
 
 ## 3. SSH stations (zero install)
 
-### 3.1 One-time: key-based access
+### 3.1 One-time: key-based access (passwords work too)
 
 `ccc` runs `ssh -T -o BatchMode=yes <spec> sh -s`, so password prompts never appear —
 key auth must already work. Verify with:
@@ -56,6 +56,26 @@ alias in `~/.ssh/config` (with port, user, jump host baked in), use the alias di
 The first connection per host pays the handshake; later polls ride an OpenSSH control
 socket (`ControlPersist=300` in `$XDG_RUNTIME_DIR`), so a poll costs one round-trip, not
 a login. Poll interval defaults to 3 s (`--interval 1` faster, `--interval 10` gentler).
+
+Password auth is fully supported as a fallback (`pass FILE`, mode 600 — `sshpass -f` reads
+it; the password never touches argv, config parsing, or logs), and ssh tries the key first,
+so both can be configured at once. **Prefer keys for polled stations.** Every password
+handshake counts against server-side login throttling (OpenSSH ≥9.8 rate caps, PAM
+faillock): exceed the burst allowance and you get `kex_exchange_identification: Connection
+reset by peer` from manual logins, then lockouts that extend on every reattempt. One-way
+fix: deploy keys (`ssh-copy-id`) and let the control socket carry everything.
+
+If `ssh-copy-id` succeeds yet BatchMode logins are refused, check the CLIENT policy before
+blaming the server: RHEL/Fedora FIPS crypto policies drop `ssh-ed25519` from OpenSSH's
+default `PubkeyAcceptedAlgorithms`, so the client silently skips your key before offering
+it (`debug1: Skipping ... id_ed25519 - corresponding algorithm not in
+PubkeyAcceptedAlgorithms`). Re-add the algorithm per host in `~/.ssh/config`:
+
+```
+Host myserver
+    IdentityFile ~/.ssh/id_ed25519
+    PubkeyAcceptedAlgorithms +ssh-ed25519
+```
 
 ### 3.2 Adding stations
 
@@ -125,7 +145,9 @@ warn     70
 crit     90
 sort     mem
 verbose
-focus    fedora                     # tab opened on start: label, prefix (K8S:), or number
+focus    fedora                     # tab opened on start: label, prefix (K8S:), 1-based number, or "overview"
+summary  overview                    # quick-stats strip: own Overview tab (default), every tab (all), off
+throttle_wait 5                      # seconds before each station's ONE login-throttle retry
 ```
 
 Rules that keep surprises out:
@@ -135,6 +157,11 @@ Rules that keep surprises out:
   CLI > config file > built-in defaults.
 - Launching with `--k8s` opens focused **on the fleet tab** — you asked for the cluster, you
   land on it. `--focus`/`focus` overrides that choice.
+- Plain `ccc` lands on the **Overview** tab (tab 1): every station as one colored row of
+  cpu / mem / nvram / load / disk. Station tabs carry only their own detail panels; the
+  quick-stats strip appears nowhere else. `summary all` restores the strip on every tab;
+  `summary off` removes it and the Overview tab, so tab numbers shift back by one.
+  With Overview present, `--focus 2` is your first station, not the local tab.
 - One `k8s` line per profile (run a second `ccc --config ...` window for a second cluster).
 - Labels become tab names; they must be unique across the fleet.
 - **A bad config fails fast and loud.** Unknown directives, duplicate labels, unparsable
@@ -284,3 +311,46 @@ if your policy demands.)
   control-character sanitized before it reaches your terminal — a malicious remote cannot
   inject escape sequences into the dashboard.
 - `ccc` sends NO data anywhere except the ssh destinations you name. There is no telemetry.
+
+## 9. Dependencies: checking and installing
+
+`ccc` shells out to three tools, each required only by the feature you configure:
+
+- **ssh** — every remote station (`-H`) and every Proxmox seed (`-P`). The collector rides
+  `ssh <host> sh -s`; nothing is installed on the far side. Package: `openssh-clients`
+  (Fedora/RHEL), `openssh-client` (Debian/Ubuntu).
+- **sshpass** — password-mode auth. When `--pass FILE` (or a config `pass` line) is present,
+  ccc wraps ssh as `sshpass -f FILE ssh …`; without the binary every password station fails.
+  Package: `sshpass` (EPEL on RHEL-family). Key-based stations never need it.
+- **kubectl** — the Kubernetes tab only. It talks to clusters through your kubeconfig, so
+  existing contexts, namespaces, and auth plugins keep working. Not shipped by every distro:
+  Fedora has `kubernetes-client`; Debian/Ubuntu users typically install from upstream
+  (<https://kubernetes.io/docs/tasks/tools/>); `ccc` prints exactly that guidance for you.
+
+### What the check looks like
+
+Before connecting anywhere, startup probes each tool this launch will exec. Missing tools on
+an interactive terminal get an offer:
+
+```
+ccc: 1 optional tool(s) missing for this launch:
+  • sshpass — --pass password auth (feeds the password to ssh non-interactively)
+Package manager detected: Dnf
+Install 'sshpass' now? [y]es ([dnf] package) · [d] download instructions · [n] skip > y
+running: dnf install -y sshpass
+sshpass installed.
+```
+
+- `y` runs the package manager's install (prefixed with `sudo` unless you are root), then
+  re-probes; success continues straight into the dashboard.
+- `d` prints the exact package command (and the upstream project site where relevant) and
+  leaves the choice of running it to you.
+- `n` skips — if the launch still needs the tool, ccc exits with code 3 and says why,
+  instead of opening tabs that fail at every sample.
+- Non-interactive launches (`--once`, cron, pipes) print the same hint lines and exit 3 when
+  anything required is missing; prompts would just hang.
+
+Local-only dashboards (`ccc` with no `-H`/`--k8s`/`-P` and no config stations) require no
+external binaries at all, so the check is silent. Ceph health on PVE uses `ceph status
+--format json | python3` **on the hypervisor** over the existing SSH session — there is no
+client-side dependency for it.

@@ -150,6 +150,74 @@ pub struct KubePod {
     pub mem_bytes: u64,
 }
 
+/// One Proxmox VE hypervisor node, from `pvesh get /cluster/status` (name, ip, online)
+/// joined with `/cluster/resources --type node` (cpu, mem, uptime). All fields arrive in
+/// ONE ssh round-trip on the seed node — no per-node login needed for the cluster view.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PveNode {
+    pub name: String,
+    pub ip: String,
+    /// True when the cluster reports the node online; offline nodes carry no live cpu/mem.
+    pub online: bool,
+    /// Percent of the WHOLE host's cores (PVE semantics), 0..100. None = not reported.
+    pub cpu_pct: Option<f64>,
+    pub max_cpu: u64,
+    pub mem_bytes: u64,
+    pub max_mem_bytes: u64,
+    pub uptime_s: u64,
+}
+
+/// One VM or container on the cluster (`/cluster/resources --type vm`). Kubernetes exposes
+/// pods; Proxmox exposes guests — this is the hypervisor-level analog of TOP PODS.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PveGuest {
+    pub vmid: u32,
+    /// "qemu" (VM) or "lxc" (container), verbatim from the type column.
+    pub kind: String,
+    pub name: String,
+    pub node: String,
+    /// running | stopped | paused | ...; empty when the node is offline and knows nothing.
+    pub status: String,
+    pub template: bool,
+    /// Percent of the guest's OWN allocated cores, normalized by PVE against vCPU count.
+    pub cpu_pct: Option<f64>,
+    pub max_cpu: u64,
+    pub mem_bytes: u64,
+    pub max_mem_bytes: u64,
+}
+
+/// One storage attachment as `pvesh get /nodes/<n>/storage` reports it: dir/NFS/LVM-thin/
+/// CephFS/RBD pools seen from that node. Usage figures are PER NODE (the same NFS export
+/// mounts everywhere); `used_pct` comes straight from PVE's own used_fraction column.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PveStorage {
+    pub node: String,
+    pub name: String,
+    /// dir | nfs | lvmthin | lvm | zfspool | cephfs | rbd | … (type column verbatim).
+    pub kind: String,
+    /// Content types the storage accepts ("images,rootdir",…, truncated at display time.
+    pub content: String,
+    pub total_bytes: u64,
+    pub avail_bytes: u64,
+    pub used_bytes: u64,
+    /// Percent full per PVE's used_fraction; None on offline/inactive storages.
+    pub used_pct: Option<f64>,
+}
+
+/// Full snapshot of one Proxmox cluster from a single seed-node connection.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PveCluster {
+    pub nodes: Vec<PveNode>,
+    pub guests: Vec<PveGuest>,
+    pub storage: Vec<PveStorage>,
+    /// Health summary parsed from `pvesh get /cluster/ceph/health` — "OK"/"WARN"/
+    /// "HEALTH_WARN"/… Unparsable sections land in `notes` instead, never here.
+    pub ceph_health: Option<String>,
+    /// Human-readable collection issues (missing pvesh, unparsable sections…). Surfaced
+    /// on the panel like kube notes — never silently dropped.
+    pub notes: Vec<String>,
+}
+
 /// A PersistentVolumeClaim: provisioned storage a workload reserved. Metrics-server does
 /// not report filesystem usage INSIDE a volume (that needs Prometheus/kubelet stats), so
 /// ccc reports capacity/status/class truthfully instead of inventing a percentage.

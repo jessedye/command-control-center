@@ -553,16 +553,106 @@ fn link_speed_linux(iface: &str) -> Option<u32> {
 // ---------------------------------------------------------------------------
 
 pub struct RemoteCollector {
+    /// See RemoteSpec::retry_ms (config `throttle_wait`).
+    pub retry_ms: u64,
     pub label: String,
     /// Extra ssh argv (jump hosts, ports, identity files...).
     pub ssh_args: Vec<String>,
     pub host: String,
+    /// Password file for `sshpass -f` (Proxmox root auth has no key by default). None =
+    /// plain key-based ssh via BatchMode; Some switches to sshpass + accept-new host keys.
+    pub pass_file: Option<String>,
     net_base: NetBaseline,
     prev_at: Instant,
 }
 
+/// One-shot remote execution shared by RemoteCollector and the PVE collector: runs `script`
+/// on `host` through `ssh host sh -s`, stdin-piped, deadline-bounded. With `pass_file` set,
+/// the invocation is wrapped in `sshpass -f FILE`.
+///
+/// CRITICAL pairing: password mode must NOT send `-o BatchMode=yes` — BatchMode disables
+/// every interactive prompt, which includes the very password prompt sshpass exists to
+/// answer; keeping it makes sshpass exit 5 ("no more passwords") instantly. Password mode
+/// also sets StrictHostKeyChecking=accept-new so first contact with a discovered node can
+/// never block on a yes/no prompt (the original BatchMode's purpose).
+pub fn run_remote_script(
+    script: &str,
+    ssh_args: &[String],
+    host: &str,
+    pass_file: Option<&str>,
+) -> Result<String, String> {
+    let (program, mut args): (&str, Vec<String>) = match pass_file {
+        Some(f) => (
+            "sshpass",
+            vec![
+                "-f".to_string(),
+                f.to_string(),
+                "ssh".to_string(),
+                "-T".to_string(),
+                "-o".to_string(),
+                "StrictHostKeyChecking=accept-new".to_string(),
+            ],
+        ),
+        None => {
+            let mut v = vec!["-T".to_string()];
+            v.extend(["-o".to_string(), "BatchMode=yes".to_string()]);
+            ("ssh", v)
+        }
+    };
+    // Connection multiplexing (owner screenshot 2026-10-11): a 9-tab fleet launch opens nine
+    // concurrent handshakes per tick; Proxmox sshd's default MaxStartups (~10 unauthenticated)
+    // drops the surplus with `kex_exchange_identification: Connection closed`. A persisted
+    // control master collapses every sample per host onto ONE connection after the first.
+    // %C hashes host+port+user so no socket name exceeds the 104-char sun_path limit.
+    // XDG_RUNTIME_DIR (not $HOME): same choice as RemoteCollector::new, so pve seeds and
+    // station samplers share one control socket per host. The dir lives on tmpfs, so no
+    // HOME dependency and no stale sockets surviving reboots.
+    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_e| "/tmp".to_string());
+    if std::fs::create_dir_all(&dir).is_ok() {
+        args.extend([
+            "-o".to_string(),
+            "ControlMaster=auto".to_string(),
+            "-o".to_string(),
+            format!("ControlPath={dir}/ccc-ssh-%C"),
+            "-o".to_string(),
+            "ControlPersist=300".to_string(),
+        ]);
+    }
+    // ConnectTimeout applies to ssh in both modes (it rides inside sshpass's ssh argv as a
+    // passthrough option because anything after `ssh` below is ssh's argv).
+    args.extend([
+        "-o".to_string(),
+        "ConnectTimeout=8".to_string(),
+    ]);
+    args.extend(ssh_args.iter().cloned());
+    args.push(host.to_string());
+    args.push("sh -s".to_string());
+
+    let (code, stdout, stderr) = run_bounded(program, &args, Some(script.as_bytes()), SSH_TIMEOUT)?;
+    match code {
+        Some(0) => Ok(String::from_utf8_lossy(&stdout).into_owned()),
+        Some(c) => {
+            let tail = format::trunc(String::from_utf8_lossy(&stderr).trim(), 160);
+            Err(format!("{program} exited {c} {tail}"))
+        }
+        None => Err("ssh killed by signal".to_string()),
+    }
+}
+
+/// Signatures of server-side login throttling (PAM faillock / OpenSSH connection caps):
+/// reset-then-retry immediately makes these WORSE — every attempt re-extends the window.
+/// Callers get exactly one slow retry; rapid loops are explicitly not the cure.
+pub fn auth_throttled(msg: &str) -> bool {
+    msg.contains("kex_exchange_identification")
+        || msg.contains("Connection closed by")
+        || msg.contains("Connection reset by")
+}
+
+/// Seconds of grace the fleet waits by default when a node answers with login throttling.
+pub const DEFAULT_THROTTLE_WAIT_MS: u64 = 3500;
+
 impl RemoteCollector {
-    pub fn new(label: String, host: String, mut ssh_args: Vec<String>) -> Self {
+    pub fn new(label: String, host: String, mut ssh_args: Vec<String>, pass_file: Option<String>, retry_ms: u64) -> Self {
         // Multiplex: first connection pays the handshake, later polls ride the socket.
         let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_e| "/tmp".to_string());
         ssh_args.extend([
@@ -573,7 +663,7 @@ impl RemoteCollector {
             "-o".to_string(),
             "ControlPersist=300".to_string(),
         ]);
-        Self { label, host, ssh_args, net_base: NetBaseline::new(), prev_at: Instant::now() }
+        Self { label, host, ssh_args, pass_file, net_base: NetBaseline::new(), prev_at: Instant::now(), retry_ms }
     }
 
     pub fn sample(&mut self) -> Result<Station, String> {
@@ -602,28 +692,20 @@ impl RemoteCollector {
     }
 
     /// Run `script` through `ssh host sh -s`, returning stdout. Connection setup failures
-    /// surface with the ssh exit code and stderr tail (BatchMode guarantees no prompts).
-    /// Review fix #7: the whole invocation is deadline-bounded and its pipes drained.
+    /// surface with the exit code and stderr tail. Review fix #7: the whole invocation is
+    /// deadline-bounded and its pipes drained. With pass_file set this goes through sshpass
+    /// (see run_remote_script for why BatchMode must be off in that mode).
     fn ssh_run(&self, script: &str) -> Result<String, String> {
-        let mut args = vec![
-            "-T".to_string(),
-            "-o".to_string(),
-            "BatchMode=yes".to_string(),
-            "-o".to_string(),
-            "ConnectTimeout=8".to_string(),
-        ];
-        args.extend(self.ssh_args.iter().cloned());
-        args.push(self.host.clone());
-        args.push("sh -s".to_string());
-
-        let (code, stdout, stderr) = run_bounded("ssh", &args, Some(script.as_bytes()), SSH_TIMEOUT)?;
-        match code {
-            Some(0) => Ok(String::from_utf8_lossy(&stdout).into_owned()),
-            Some(c) => {
-                let tail = format::trunc(String::from_utf8_lossy(&stderr).trim(), 160);
-                Err(format!("ssh exited {c} {tail}"))
+        let first = run_remote_script(script, &self.ssh_args, &self.host, self.pass_file.as_deref());
+        match first {
+            Err(e) if auth_throttled(&e) => {
+                // One slow retry only. Server-side login throttling EXTENDS the lockout on
+                // every rapid attempt (observed live on PVE nodes); rapid looping makes the
+                // station permanently red. The next sampling tick is the natural second chance.
+                std::thread::sleep(std::time::Duration::from_millis(self.retry_ms.max(250)));
+                run_remote_script(script, &self.ssh_args, &self.host, self.pass_file.as_deref())
             }
-            None => Err("ssh killed by signal".to_string()),
+            other => other,
         }
     }
 }
@@ -853,5 +935,20 @@ mod tests {
         assert_eq!(code, Some(0));
         assert_eq!(String::from_utf8_lossy(&out), "hello");
         assert_eq!(String::from_utf8_lossy(&err), "E\n");
+    }
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    use super::auth_throttled;
+
+    #[test]
+    fn recognizes_server_side_login_throttle_signatures() {
+        assert!(auth_throttled("sshpass exited 255 kex_exchange_identification: Connection closed by remote host"));
+        assert!(auth_throttled("sshpass exited 255 Connection reset by 192.0.2.242 port 22"));
+        assert!(auth_throttled("ssh exited 255 Connection closed by 10.0.0.9 port 22"));
+        assert!(!auth_throttled("ssh exited 255 Permission denied, please try again."));
+        assert!(!auth_throttled("ssh exited 255 Host key verification failed."));
+        assert!(!auth_throttled("killed by signal"), "local timeout is not a throttle");
     }
 }

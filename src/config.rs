@@ -7,20 +7,38 @@
 //! how a dashboard ends up showing one lonely tab.
 //!
 //! ```text
-//! local  fedora                       # label for the local machine tab
-//! ssh    rack4  -p 2222 admin@10.0.0.4
-//! k8s    default  homelab             # kubecontext, shown as tab K8S:homelab
-//! interval 3
-//! top    20
-//! warn   70
-//! crit   90
-//! sort   mem
+//! local     fedora                    # label for the local machine tab
+//! ssh       rack4  -p 2222 admin@10.0.0.4
+//! k8s       default  homelab          # kubecontext, shown as tab K8S:homelab
+//! proxmox   lab     root@192.0.2.241   # seed node; tab PVE:lab (alias: pve)
+//! pass      ~/.config/ccc/pve.pass    # sshpass password FILE (mode 600), applies fleet-wide
+//! discover  true                      # expand each proxmox cluster into per-node SSH stations
+//! interval  3
+//! top       20
+//! warn      70
+//! crit      90
+//! sort      mem
 //! verbose
 //! no-color
-//! focus  fedora                       # tab to open on (label, prefix, or number)
+//! focus     fedora                    # tab to open on (label, prefix, or number)
 //! ```
 
 use std::path::PathBuf;
+
+/// Where the fleet summary table (the `[n] station  cpu/mem/nvram/load` strip) lives.
+/// Owner directive 2026-10-11: it dominated every tab's top rows and hid the focused
+/// station's detail panels — `overview` moves it onto a dedicated Overview tab that is
+/// also the landing screen; `all` restores the old everywhere-chips behavior.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryMode {
+    /// Dedicated `overview` tab at position 1; station tabs show only their own detail.
+    #[default]
+    Overview,
+    /// Legacy: compact chips on every multi-station tab, no extra tab.
+    All,
+    /// Never render chips (and no Overview tab). Maximizes detail rows per station.
+    Off,
+}
 
 #[derive(Debug, Default, PartialEq)]
 pub struct FileConfig {
@@ -32,6 +50,16 @@ pub struct FileConfig {
     pub kube_ctx: Option<String>,
     /// Display name for the fleet tab (defaults to the context name).
     pub kube_label: Option<String>,
+    /// Proxmox clusters: (tab label, ssh tokens including destination, host) in file order.
+    /// Repeatable — unlike k8s, several hypervisor fleets can share one ccc session.
+    pub pves: Vec<(String, Vec<String>, String)>,
+    /// sshpass password FILE (tilde-expanded) shared by all ssh/proxmox stations.
+    pub pass_file: Option<String>,
+    /// Milliseconds between a station's sample and its single throttle-retry
+    /// (`throttle_wait SECONDS`, 0..=120; unset = DEFAULT_THROTTLE_WAIT_MS).
+    pub throttle_ms: Option<u64>,
+    /// Expand each proxmox seed into per-node SSH stations at startup.
+    pub discover_pve: bool,
     pub interval: Option<f64>,
     pub top: Option<usize>,
     pub warn: Option<f64>,
@@ -41,6 +69,15 @@ pub struct FileConfig {
     pub verbose: bool,
     pub no_color: bool,
     pub focus: Option<String>,
+    /// Placement of the fleet summary chips (`summary overview|all|off`).
+    pub summary: Option<SummaryMode>,
+}
+
+impl FileConfig {
+    /// Effective summary mode; unset config means the Overview tab (new default).
+    pub fn summary_mode(&self) -> SummaryMode {
+        self.summary.unwrap_or_default()
+    }
 }
 
 /// Resolve the default config path: `$XDG_CONFIG_HOME/ccc/ccc.conf`, falling back to
@@ -53,7 +90,24 @@ pub fn default_path() -> Option<PathBuf> {
     Some(base.join("ccc").join("ccc.conf"))
 }
 
-const SETTINGS: &[&str] = &["interval", "top", "warn", "crit", "sort", "verbose", "no-color", "focus"];
+const SETTINGS: &[&str] = &[
+    "interval", "top", "warn", "crit", "sort", "verbose", "no-color", "focus", "pass", "discover", "throttle_wait", "summary",
+];
+
+/// Expand a leading `~/` to $HOME (config paths are typed the way humans write them).
+/// A lone "~" becomes $HOME; anything else passes through unchanged. No HOME → unchanged,
+/// matching shell behavior of leaving ~ literal when unresolvable.
+pub fn expand_tilde(s: &str) -> String {
+    if s == "~" {
+        return std::env::var("HOME").unwrap_or_else(|_| s.to_string());
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    }
+    s.to_string()
+}
 
 /// Cut an inline comment from one raw config line, shell-style: a `#` starts a comment only
 /// at line start or right after whitespace that is NOT inside quotes. `"a # b"` and `key#1`
@@ -181,12 +235,45 @@ pub fn parse(text: &str) -> Result<FileConfig, Vec<String>> {
                     }
                 }
             }
+            "proxmox" | "pve" => {
+                // Same shape as `ssh`: LABEL + ssh tokens. Repeatable — a rack of Proxmox
+                // servers can be watched side by side, one tab per seed.
+                if args.len() < 2 {
+                    errs.push(bad(line_no, "'proxmox' needs a label and a seed host, e.g. 'proxmox lab root@192.0.2.241'".into()));
+                    continue;
+                }
+                let label = args[0].clone();
+                if let Err(e) = valid_label(&label) {
+                    errs.push(bad(line_no, e));
+                    continue;
+                }
+                let rest: Vec<String> = args[1..].to_vec();
+                match crate::collect::split_ssh_tokens(&rest) {
+                    Ok((_flags, host)) => {
+                        let taken: Vec<&str> = cfg
+                            .remotes
+                            .iter()
+                            .chain(cfg.pves.iter())
+                            .map(|(l, _, _)| l.as_str())
+                            .collect();
+                        if taken.contains(&label.as_str()) {
+                            errs.push(bad(line_no, format!("duplicate station label '{label}'")));
+                            continue;
+                        }
+                        cfg.pves.push((label, rest, host));
+                    }
+                    Err(e) => errs.push(bad(line_no, format!("invalid proxmox spec: {e}"))),
+                }
+            }
             _ if SETTINGS.contains(&dir) => {
                 if let Err(e) = apply_setting(&mut cfg, dir, args, line_no) {
                     errs.push(e);
                 }
             }
-            _ => errs.push(bad(line_no, format!("unknown directive '{dir}' (expected: local, ssh, k8s, {})", SETTINGS.join(", ")))),
+            _ => errs.push(bad(line_no, format!(
+                "unknown directive '{dir}' (expected: local, ssh, k8s, proxmox, {})",
+                SETTINGS.join(", ")
+            ))),
         }
     }
 
@@ -206,13 +293,15 @@ pub fn parse(text: &str) -> Result<FileConfig, Vec<String>> {
     if let Some(l) = &cfg.local_label {
         seen.push(l.clone());
     }
-    for (l, _, _) in &cfg.remotes {
+    for (l, _, _) in cfg.remotes.iter().chain(cfg.pves.iter()) {
         if seen.iter().any(|s| s == l) {
             errs.push(format!("config: duplicate station label '{l}'"));
         }
         seen.push(l.clone());
     }
-    if let Some(l) = &cfg.kube_label {
+    // Fleet display names must not shadow a station tab either (focus/prefix resolution
+    // picks the first match — a collision would silently hijack tab selection).
+    for l in [&cfg.kube_label].into_iter().flatten() {
         if seen.iter().any(|s| s == l) {
             errs.push(format!("config: fleet label '{l}' collides with a station label"));
         }
@@ -298,6 +387,50 @@ fn apply_setting(cfg: &mut FileConfig, dir: &str, args: &[String], line_no: usiz
             let v = one_value("focus")?;
             valid_label(&v).map_err(|e| bad(line_no, e))?;
             cfg.focus = Some(v);
+        }
+        "pass" => {
+            // Path only — the file's CONTENTS are read by sshpass (sshpass -f), never here,
+            // and config parsing must not touch the filesystem at all. Tilde is expanded at
+            // parse time so operators can write ~/... paths as everywhere else.
+            cfg.pass_file = Some(expand_tilde(&one_value("pass")?));
+        }
+        "discover" => {
+            let v = one_value("discover")?.to_ascii_lowercase();
+            cfg.discover_pve = match v.as_str() {
+                "true" | "yes" | "on" | "1" => true,
+                "false" | "no" | "off" | "0" => false,
+                other => {
+                    return Err(bad(
+                        line_no,
+                        format!("discover must be true/false (got '{other}')"),
+                    ));
+                }
+            };
+        }
+        "throttle_wait" => {
+            // Seconds a station waits before its ONE retry after server-side login throttling
+            // (faillock/OpenSSH connection caps). Floor lives in the collectors (250 ms).
+            let raw = one_value("throttle_wait")?;
+            let v: f64 = raw.parse().map_err(|_| bad(line_no, format!("throttle_wait must be a number of seconds (got '{raw}')")))?;
+            if !v.is_finite() || !(0.0..=120.0).contains(&v) {
+                return Err(bad(line_no, format!("throttle_wait must be 0..=120 seconds (got '{raw}')")));
+            }
+            cfg.throttle_ms = Some((v * 1000.0).round() as u64);
+        }
+        "summary" => {
+            // Where the quick-stats strip lives (owner: move it off every station screen).
+            let v = one_value("summary")?.to_ascii_lowercase();
+            cfg.summary = Some(match v.as_str() {
+                "overview" | "on" | "true" => SummaryMode::Overview,
+                "all" => SummaryMode::All,
+                "off" | "none" | "false" => SummaryMode::Off,
+                other => {
+                    return Err(bad(
+                        line_no,
+                        format!("summary must be overview|all|off (got '{other}')"),
+                    ));
+                }
+            });
         }
         _ => unreachable!("settings dispatch"),
     }
@@ -425,4 +558,88 @@ mod tests {
         assert_eq!(cfg.remotes[0].2, "root@box.local");
         assert_eq!(cfg.remotes[0].1, ["-p", "2222", "root@box.local"]);
     }
+    #[test]
+    fn proxmox_directive_parses_label_and_seed() {
+        let cfg = parse(
+            "proxmox lab root@192.0.2.241\n\
+             pve rack2 -o User=root 10.9.0.2\n\
+             pass ~/.config/ccc/pve.pass\n\
+             discover true\n",
+        )
+        .expect("clean");
+        assert_eq!(cfg.pves.len(), 2);
+        assert_eq!((cfg.pves[0].0.as_str(), cfg.pves[0].2.as_str()), ("lab", "root@192.0.2.241"));
+        // The `pve` alias behaves identically; ssh option flags stay in the argv vector.
+        assert_eq!(cfg.pves[1].0, "rack2");
+        assert_eq!(cfg.pves[1].1, ["-o", "User=root", "10.9.0.2"]);
+        // Tilde expands at parse time so operators can write ~/... paths.
+        assert!(
+            cfg.pass_file.as_deref().unwrap().starts_with("/"),
+            "tilde expanded to an absolute path: {:?}",
+            cfg.pass_file
+        );
+        assert!(cfg.pass_file.unwrap().ends_with(".config/ccc/pve.pass"));
+        assert!(cfg.discover_pve);
+    }
+
+    #[test]
+    fn multiple_proxmox_lines_are_allowed() {
+        // Unlike 'k8s', several hypervisor fleets coexist in one config file.
+        let cfg = parse("proxmox a h1\nproxmox b h2\n").expect("clean");
+        assert_eq!(cfg.pves.len(), 2);
+    }
+
+    #[test]
+    fn pass_setting_requires_a_value_and_expands_tilde() {
+        let e = parse("pass\n").unwrap_err();
+        assert!(e[0].contains("takes exactly one value"), "{e:?}");
+        let cfg = parse("pass ~\n").expect("clean");
+        assert!(!cfg.pass_file.unwrap().starts_with('~'), "bare ~ expands to home");
+    }
+
+    #[test]
+    fn discover_accepts_common_bool_spellings() {
+        for (word, want) in [("true", true), ("on", true), ("yes", true), ("off", false), ("no", false), ("false", false)] {
+            let cfg = parse(&format!("discover {word}\n")).expect(word);
+            assert_eq!(cfg.discover_pve, want, "{word}");
+        }
+        let e = parse("discover maybe\n").unwrap_err();
+        assert!(e[0].contains("discover must be true/false"), "{e:?}");
+    }
+
+    #[test]
+    fn proxmox_needs_label_and_destination() {
+        let e = parse("proxmox lab\n").unwrap_err();
+        assert!(e[0].contains("label and a seed host"), "{e:?}");
+    }
+
+    #[test]
+    fn ssh_and_proxmox_labels_collide() {
+        // A proxmox tab named like an existing ssh station would hijack focus resolution.
+        let e = parse("ssh node3 box.example\npve node3 10.0.0.3\n").unwrap_err();
+        assert!(e.iter().any(|m| m.contains("duplicate station label 'node3'")), "{e:?}");
+    }
+
+    #[test]
+    fn throttle_wait_parses_and_range_checks() {
+        let cfg = parse("throttle_wait 5\n").unwrap();
+        assert_eq!(cfg.throttle_ms, Some(5000));
+        let cfg = parse("throttle_wait 0.4\n").unwrap();
+        assert_eq!(cfg.throttle_ms, Some(400));
+        assert!(parse("throttle_wait 999\n").is_err(), "range 0..=120 enforced");
+        assert!(parse("throttle_wait\n").is_err(), "needs a value");
+        assert!(parse("throttle_wait fast\n").is_err(), "must be numeric");
+    }
+
+    #[test]
+    fn summary_parses_aliases_and_rejects_garbage() {
+        assert_eq!(FileConfig::default().summary_mode(), SummaryMode::Overview, "unset = overview tab");
+        assert_eq!(parse("summary all\n").unwrap().summary_mode(), SummaryMode::All);
+        assert_eq!(parse("summary OFF\n").unwrap().summary_mode(), SummaryMode::Off);
+        assert_eq!(parse("summary On\n").unwrap().summary_mode(), SummaryMode::Overview);
+        let e = parse("summary nope\n").unwrap_err();
+        assert!(e[0].contains("overview|all|off"), "{e:?}");
+        assert!(parse("summary\n").is_err(), "needs a value");
+    }
+
 }

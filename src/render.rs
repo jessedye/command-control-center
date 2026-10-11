@@ -655,22 +655,36 @@ fn nvram_panel(view: &View, h: &Station) -> Vec<Row> {
             seg("NVRAM", St::Head),
             seg(format!(" {vendor}{} · util {:.0}%{temp}", trunc_cell(&g.name, 34 - vendor.len()), g.util_pct), St::Dim),
         ]);
-        rows.push(vec![
-            seg("VRAM ", St::Dim),
-            seg("[", St::Rule),
-            seg(bar(g.vram_pct(), (w / 3).max(10)), st),
-            seg("]", St::Rule),
-            seg(
-                format!(
-                    " {:.1}/{:.1} GiB ({:.0}%) ",
-                    g.vram_used_mib / 1024.0,
-                    g.vram_total_mib / 1024.0,
-                    g.vram_pct()
+        // Integrated/unified parts (GB10): capacity may be knowable from host RAM while
+        // usage comes from CUDA process totals — and vice versa. Draw what we have.
+        match (g.vram_used_mib, g.vram_total_mib) {
+            (Some(used), Some(total)) if total > 0.0 => rows.push(vec![
+                seg("VRAM ", St::Dim),
+                seg("[", St::Rule),
+                seg(bar(g.vram_pct(), (w / 3).max(10)), st),
+                seg("]", St::Rule),
+                seg(
+                    format!(" {:.1}/{:.1} GiB ({:.0}%) ", used / 1024.0, total / 1024.0, g.vram_pct()),
+                    st,
                 ),
-                st,
-            ),
-            seg(lamp(st), st),
-        ]);
+                seg(lamp(st), st),
+            ]),
+            (u, Some(total)) if total > 0.0 => rows.push(vec![
+                seg("VRAM ", St::Dim),
+                seg(
+                    format!(
+                        " unified pool {:.1} GiB{}",
+                        total / 1024.0,
+                        u.map(|_| "").unwrap_or(" · per-process usage unreadable")
+                    ),
+                    St::Dim,
+                ),
+            ]),
+            _ => rows.push(vec![
+                seg("VRAM ", St::Dim),
+                seg("utilization-only device · unified memory, capacity not exposed", St::Dim),
+            ]),
+        }
     }
     rows
 }

@@ -263,7 +263,25 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     # ENTIRE host frame for an unreadable temperature sensor. Validate numerics per row:
     # unusable memory/util drops just that GPU row, a non-numeric temperature becomes -1
     # (decode's None sentinel). Rows shorter than five columns cannot index safely — skip.
-    GPUS=$(printf '%s\n' "$NVOUT" | awk -F', ' '
+    # Integrated/unified GPUs (DGX Spark GB10 and friends) answer [N/A] for FB memory:
+    # nvidia-smi has NO query exposing usage of the unified LPDDR5x pool. Best available
+    # per-GPU signal: sum of CUDA processes' allocations (MiB) against host MemTotal —
+    # truthful NVRAM usage for owners watching inference boxes (owner request 2026-10-11).
+    # Single-instance assumption (one integrated GPU per box): the allocation total is
+    # applied to every row whose own FB memory came back N/A.
+    CA_SUM=-1
+    MT_MIB=0
+    if command -v timeout >/dev/null 2>&1; then
+        CA_RAW=$(timeout 5 nvidia-smi --query-compute-apps=used_memory --format=csv,noheader,nounits 2>/dev/null)
+    else
+        CA_RAW=$(nvidia-smi --query-compute-apps=used_memory --format=csv,noheader,nounits 2>/dev/null)
+    fi
+    if [ -n "$CA_RAW" ]; then
+        CA_SUM=$(printf '%s\n' "$CA_RAW" | awk '/^[ ]*[0-9]+([.][0-9]+)?[ ]*$/ {gsub(/ /,""); s+=$1} END {printf "%d", s}')
+    fi
+    MT_MIB=$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+    [ -n "$MT_MIB" ] || MT_MIB=0
+    GPUS=$(printf '%s\n' "$NVOUT" | awk -F', ' -v alloc="$CA_SUM" -v pool="$MT_MIB" '
     NF < 5 { next }
     {
         # Names may legally contain commas ("Tesla T4, Rev A") — rebuild everything left
@@ -278,8 +296,15 @@ if command -v nvidia-smi >/dev/null 2>&1; then
         gsub(/^ +| +$/, "", tt)
         if (name == "") name = "NVIDIA GPU"
         num = "^[0-9]+([.][0-9]+)?$"
-        if (mu !~ num || mt !~ num || uu !~ num) next
-        if (mt + 0 <= 0) next
+        # Round-2 finding 4 kept: a non-numeric UTILIZATION drops the row (it is the gauge).
+        if (uu !~ num) next
+        # Unified-memory rows: N/A memory becomes -1 (wire sentinel = unknown), filled from
+        # the shell-side probes where possible. Rows with both fields unknowable still emit
+        # (util/temp are what owners watch on GB10 boxes; decode maps -1 -> None).
+        if (mu !~ num) mu = -1
+        if (mt !~ num) mt = -1
+        if (mu + 0 < 0 && alloc + 0 >= 0) mu = alloc
+        if (mt + 0 < 0 && pool + 0 > 0) mt = pool
         if (tt ~ /^-?[0-9]+([.][0-9]+)?$/) { temp = tt + 0 } else { temp = -1 }
         gsub(/%/, "%25", name); gsub(/\|/, "%7C", name); gsub(/\r/, "", name)
         printf "gpu=nvidia|%s|%.0f|%.0f|%.1f|%.0f\n", name, mu + 0, mt + 0, uu + 0, temp

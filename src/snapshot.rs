@@ -43,18 +43,21 @@ pub enum GpuVendor {
 pub struct GpuRow {
     pub vendor: GpuVendor,
     pub name: String,
-    pub vram_used_mib: f64,
-    pub vram_total_mib: f64,
+    /// VRAM in use, MiB. `None` where the driver refuses to answer (`[N/A]`) —
+    /// exactly what integrated/unified parts like the DGX Spark's GB10 do: their
+    /// memory lives in host RAM, so "used" is reported as the sum of per-process
+    /// CUDA allocations instead (see collector.sh).
+    pub vram_used_mib: Option<f64>,
+    pub vram_total_mib: Option<f64>,
     pub util_pct: f64,
     pub temp_c: Option<f64>,
 }
 
 impl GpuRow {
     pub fn vram_pct(&self) -> f64 {
-        if self.vram_total_mib > 0.0 {
-            100.0 * self.vram_used_mib / self.vram_total_mib
-        } else {
-            0.0
+        match (self.vram_used_mib, self.vram_total_mib) {
+            (Some(u), Some(t)) if t > 0.0 => 100.0 * u / t,
+            _ => 0.0,
         }
     }
 }

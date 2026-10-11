@@ -50,29 +50,40 @@ pub fn parse_nvidia_csv(text: &str) -> Vec<GpuRow> {
         // Fields counted from the right end: index + name are variable length.
         // Round-2 finding 31: Rust's f64 parse accepts "NaN"/"inf", so numeric fields must
         // be checked FINITE (and sane) before they render as healthy-looking gauges.
-        let nums: Vec<f64> =
-            [n - 4, n - 3, n - 2, n - 1].iter().filter_map(|&i| parts[i].trim().parse().ok()).collect();
-        if nums.len() != 4 {
-            continue;
-        }
-        let (used, total, util, temp) = (nums[0], nums[1], nums[2], nums[3]);
-        if !(used.is_finite() && total.is_finite() && util.is_finite() && temp.is_finite()) {
-            continue;
-        }
-        if used < 0.0 || total <= 0.0 || util < 0.0 {
+        // `(value, parsed_ok)` per field — memory cells may legally say [N/A].
+        let used = opt_num(parts[n - 4]);
+        let total = opt_num(parts[n - 3]);
+        let util = opt_num(parts[n - 2]);
+        let temp = opt_num(parts[n - 1]);
+        // Round-2 finding 31 + unified-memory GPUs (owner request 2026-10-11): `[N/A]`
+        // in a memory field is LEGAL and must NOT kill the row — the DGX Spark's GB10
+        // reports util/temp/power fine while hiding its unified LPDDR5x behind N/A.
+        // A non-numeric UTILIZATION still drops the row (it is the gauge itself).
+        if !util.1 || util.0 < 0.0 {
             continue;
         }
         let name = parts[1..n - 4].join(", ");
         out.push(GpuRow {
             vendor: GpuVendor::Nvidia,
             name,
-            vram_used_mib: used,
-            vram_total_mib: total,
-            util_pct: util,
-            temp_c: if temp < 0.0 { None } else { Some(temp) },
+            vram_used_mib: if used.1 { Some(used.0.max(0.0)) } else { None },
+            vram_total_mib: if total.1 && total.0 > 0.0 { Some(total.0) } else { None },
+            util_pct: util.0.min(100.0),
+            temp_c: if temp.1 && temp.0 >= 0.0 { Some(temp.0) } else { None },
         });
     }
     out
+}
+
+/// `f64` parse with `[N/A]` / `[Not Supported]` support: `(value, ok)` — `ok=false`
+/// covers garbage AND legal non-numeric cells (callers decide which matter).
+fn opt_num(s: &str) -> (f64, bool) {
+    let t = s.trim().trim_start_matches('[').trim_end_matches(']').trim();
+    // "N/A", "Not Supported": strip trailing prose ("N/A" has none; keep parse strict).
+    match t.parse::<f64>() {
+        Ok(v) if v.is_finite() => (v, true),
+        _ => (-1.0, false),
+    }
 }
 
 fn read_int_file(p: &Path) -> Option<u64> {
@@ -128,8 +139,8 @@ fn read_amdgpu_device(device: &Path, temps: &[(PathBuf, f64)]) -> Option<GpuRow>
     Some(GpuRow {
         vendor: GpuVendor::Amd,
         name: amd_card_name(device),
-        vram_used_mib: used as f64 / 1048576.0,
-        vram_total_mib: (total.max(1)) as f64 / 1048576.0,
+        vram_used_mib: Some(used as f64 / 1048576.0),
+        vram_total_mib: Some((total.max(1)) as f64 / 1048576.0),
         util_pct: util as f64,
         temp_c,
     })
@@ -158,7 +169,7 @@ mod tests {
         );
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].name, "NVIDIA GeForce RTX 4090");
-        assert_eq!(rows[0].vram_used_mib, 15834.0);
+        assert_eq!(rows[0].vram_used_mib, Some(15834.0));
         assert_eq!(rows[0].temp_c, Some(57.0));
         assert_eq!(rows[1].vendor, GpuVendor::Nvidia);
     }
@@ -169,10 +180,29 @@ mod tests {
         let rows = parse_nvidia_csv("0, Model, Pro, 100, 200, 10, 30\n");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "Model, Pro");
-        assert_eq!(rows[0].vram_used_mib, 100.0);
-        assert_eq!(rows[0].vram_total_mib, 200.0);
+        assert_eq!(rows[0].vram_used_mib, Some(100.0));
+        assert_eq!(rows[0].vram_total_mib, Some(200.0));
         assert_eq!(rows[0].util_pct, 10.0);
         assert_eq!(rows[0].temp_c, Some(30.0));
+    }
+
+    #[test]
+    fn nvidia_gb10_unified_memory_keeps_the_row_with_na_vram() {
+        // Live DGX Spark output (2026-10-11): util/temperature are real numbers while the
+        // integrated LPDDR5x shows [N/A]. The row must survive with vram=None so the NVRAM
+        // panel can show utilization/temperature at all.
+        let rows = parse_nvidia_csv("0, NVIDIA GB10, [N/A], [N/A], 93, 47\n");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "NVIDIA GB10");
+        assert_eq!(rows[0].util_pct, 93.0);
+        assert_eq!(rows[0].temp_c, Some(47.0));
+        assert_eq!(rows[0].vram_used_mib, None);
+        assert_eq!(rows[0].vram_total_mib, None);
+        assert_eq!(rows[0].vram_pct(), 0.0);
+        // Numeric memory still wins when present (discrete GPUs unchanged).
+        let rows = parse_nvidia_csv("0, NVIDIA GeForce RTX 4090, 6144, 24576, 75, 61\n");
+        assert_eq!(rows[0].vram_used_mib, Some(6144.0));
+        assert_eq!(rows[0].vram_pct(), 100.0 * 6144.0 / 24576.0);
     }
 
     #[test]
@@ -191,8 +221,8 @@ mod tests {
         fs::write(dev.join("gpu_busy_percent"), "42\n").unwrap();
         fs::write(dev.join("uevent"), "DRIVER=amdgpu\nPCI_ID=1002:744C\n").unwrap();
         let row = read_amdgpu_device(&dev, &[]).unwrap();
-        assert_eq!(row.vram_total_mib, 16384.0);
-        assert_eq!(row.vram_used_mib, 4096.0);
+        assert_eq!(row.vram_total_mib, Some(16384.0));
+        assert_eq!(row.vram_used_mib, Some(4096.0));
         assert_eq!(row.util_pct, 42.0);
         assert!(row.name.contains("1002:744C"));
         assert!(read_amdgpu_device(&dev.join("missing"), &[]).is_none());

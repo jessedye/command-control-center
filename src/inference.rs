@@ -75,11 +75,11 @@ impl Baseline {
         let mut elapsed = dt + self.missed_dt.get(key).copied().unwrap_or(0.0);
         let mut oldest = None;
         for point in history.iter().rev() {
-            elapsed += point.dt.max(0.0);
             oldest = select(point);
             if elapsed >= RATE_WINDOW_SECS {
                 break;
             }
+            elapsed += point.dt.max(0.0);
         }
         let old = oldest?;
         (elapsed > 0.0 && now >= old).then_some((now - old) / elapsed)
@@ -591,6 +591,21 @@ mod tests {
         counter.prompt_total = Some(0.0);
         counter.generated_total = Some(100.0);
         assert_eq!(baseline.rates(1.0, &[counter])[0].output_tps, Some(25.0));
+    }
+
+    #[test]
+    fn rolling_rate_is_independent_of_sample_interval() {
+        let mut baseline = Baseline::new();
+        let mut counter = Counter {
+            harness: "vLLM".into(), endpoint: "127.0.0.1:8000".into(), connect_host: "127.0.0.1".into(),
+            pid: 1, active: Some(1.0), queued: None, prompt_total: Some(0.0), generated_total: Some(0.0), native_tps: None,
+        };
+        baseline.commit(0.0, &[counter.clone()]);
+        for _ in 0..12 {
+            counter.generated_total = Some(counter.generated_total.unwrap() + 100.0);
+            assert_eq!(baseline.rates(2.0, &[counter.clone()])[0].output_tps, Some(50.0));
+            baseline.commit(2.0, &[counter.clone()]);
+        }
     }
 
     #[test]

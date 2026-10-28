@@ -326,6 +326,221 @@ if [ -z "$GPUS" ]; then
     done)
 fi
 
+# --- AI inference listeners ---------------------------------------------
+# Optional and agentless: Python's standard library discovers full argv and scrapes
+# loopback /metrics in parallel. Hosts without python3 simply omit these rows.
+INFERENCE=""
+if command -v python3 >/dev/null 2>&1; then
+INFERENCE=$(python3 - 2>/dev/null <<'PY'
+import concurrent.futures
+import glob
+import math
+import subprocess
+import urllib.request
+
+MAX = 4 * 1024 * 1024
+GENERATED = {
+    "vllm:generation_tokens_total", "vllm:generation_tokens",
+    "sglang:generation_tokens_total", "sglang:generated_tokens_total",
+    "tgi_request_generated_tokens_total", "tgi_request_generated_tokens_sum",
+    "trt_llm:generation_tokens_total", "nv_trt_llm_generation_tokens_total",
+    "ollama_generated_tokens_total", "ollama:generation_tokens_total",
+    "ollama:eval_count_total", "llamacpp:tokens_predicted_total",
+    "llamacpp:tokens_predicted", "lmdeploy:generation_tokens_total",
+}
+PROMPT = {
+    "vllm:prompt_tokens_total", "vllm:prompt_tokens",
+    "sglang:prompt_tokens_total", "tgi_request_input_tokens_total",
+    "tgi_request_input_length_sum", "trt_llm:prompt_tokens_total",
+    "nv_trt_llm_prompt_tokens_total", "ollama_prompt_tokens_total",
+    "ollama:prompt_tokens_total", "ollama:prompt_eval_count_total",
+    "llamacpp:prompt_tokens_total", "lmdeploy:prompt_tokens_total",
+}
+ACTIVE = {
+    "vllm:num_requests_running", "sglang:num_running_reqs",
+    "tgi_batch_current_size", "ollama_active_requests",
+    "ollama:num_requests_running", "llamacpp:requests_processing",
+    "lmdeploy:num_requests_running",
+}
+QUEUED = {
+    "vllm:num_requests_waiting", "sglang:num_queue_reqs", "tgi_queue_size",
+    "ollama_pending_requests", "llamacpp:requests_deferred",
+    "lmdeploy:num_requests_waiting",
+}
+
+def executable(args, name):
+    return any(a.rsplit("/", 1)[-1].lower() in (name, name + ".exe") for a in args)
+
+def option(args, names):
+    for i, arg in enumerate(args):
+        for name in names:
+            if arg == name and i + 1 < len(args):
+                return args[i + 1]
+            if arg.startswith(name + "="):
+                return arg.split("=", 1)[1]
+    return None
+
+def identify(args):
+    lower = [a.lower() for a in args]
+    has = lambda s: any(s in a for a in lower)
+    if (executable(lower, "vllm") and "serve" in lower) or has("vllm.entrypoints.openai.api_server"):
+        return "vLLM", 8000
+    if has("sglang.launch_server") or has("sgl.launch_server"):
+        return "SGLang", 30000
+    if executable(lower, "text-generation-launcher"):
+        return "TGI", 80
+    if executable(lower, "trtllm-serve") or has("tensorrt_llm.serve"):
+        return "TensorRT-LLM", 8000
+    if executable(lower, "tritonserver"):
+        return "TensorRT-LLM", 8002
+    if executable(lower, "ollama") and "serve" in lower:
+        return "Ollama", 11434
+    if executable(lower, "llama-server"):
+        return "llama.cpp", 8080
+    if executable(lower, "lmdeploy") and any(lower[i:i+2] == ["serve", "api_server"] for i in range(len(lower)-1)):
+        return "LMDeploy", 23333
+    return None
+
+def discover():
+    found = {}
+    for path in glob.glob("/proc/[0-9]*/cmdline"):
+        try:
+            args = [a.decode("utf-8", "replace") for a in open(path, "rb").read().split(b"\0") if a]
+        except (OSError, IOError):
+            continue
+        kind = identify(args) if args else None
+        if not kind:
+            continue
+        harness, default_port = kind
+        try:
+            port = int(option(args, ("--metrics-port", "--port", "--http-port")) or default_port)
+            if not 1 <= port <= 65535:
+                continue
+        except ValueError:
+            continue
+        host = option(args, ("--host", "--http-address", "--address")) or "127.0.0.1"
+        host = host.strip("[]")
+        if host in ("", "0.0.0.0", "::", "*"):
+            host = "127.0.0.1"
+        elif host == "localhost":
+            host = "127.0.0.1"
+        if "/" in host or any(c.isspace() for c in host):
+            continue
+        endpoint = ("[%s]:%d" if ":" in host else "%s:%d") % (host, port)
+        key = harness + "|" + endpoint
+        if key not in found:
+            found[key] = (harness, endpoint, host, int(path.split("/")[2]), port)
+    return sorted(found.values())
+
+def resolve_container_ports(servers):
+    containerized = False
+    for server in servers:
+        try:
+            cgroup = open("/proc/%d/cgroup" % server[3]).read()
+            if any(k in cgroup for k in ("docker", "kubepods", "containerd", "libpod")):
+                containerized = True
+                break
+        except (OSError, IOError):
+            pass
+    if not containerized:
+        return servers
+    template = "{{.State.Pid}} {{range $port, $bindings := .NetworkSettings.Ports}}{{if $bindings}}{{$port}}={{(index $bindings 0).HostIp}}:{{(index $bindings 0).HostPort}},{{end}}{{end}}"
+    for runtime in ("docker", "podman"):
+        try:
+            ps = subprocess.run([runtime, "ps", "-q"], capture_output=True, text=True, timeout=2)
+            if ps.returncode:
+                continue
+            ids = ps.stdout.split()
+            if not ids:
+                return servers
+            inspected = subprocess.run([runtime, "inspect", "--format", template] + ids, capture_output=True, text=True, timeout=2)
+            if inspected.returncode:
+                continue
+        except (OSError, subprocess.SubprocessError):
+            continue
+        by_pid = {}
+        for line in inspected.stdout.splitlines():
+            fields = line.split()
+            if not fields or not fields[0].isdigit():
+                continue
+            by_pid[int(fields[0])] = fields[1:]
+        resolved = []
+        for harness, endpoint, host, pid, port in servers:
+            for mapping in by_pid.get(pid, []):
+                prefix = "%d/tcp=" % port
+                if not mapping.startswith(prefix):
+                    continue
+                hostport = mapping[len(prefix):].rstrip(",")
+                if ":" not in hostport:
+                    continue
+                mapped_host, mapped_port = hostport.rsplit(":", 1)
+                if mapped_host in ("", "0.0.0.0", "::"):
+                    mapped_host = "127.0.0.1"
+                if mapped_port.isdigit():
+                    host, port = mapped_host, int(mapped_port)
+                    endpoint = ("[%s]:%d" if ":" in host else "%s:%d") % (host, port)
+            resolved.append((harness, endpoint, host, pid, port))
+        return resolved
+    return servers
+
+def add(metrics, key, value):
+    metrics[key] = metrics.get(key, 0.0) + max(0.0, value)
+
+def scrape(server):
+    harness, endpoint, host, pid, port = server
+    url_host = "[%s]" % host if ":" in host else host
+    request = urllib.request.Request("http://%s:%d/metrics" % (url_host, port), headers={"Accept": "text/plain"})
+    metrics = {}
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=0.75) as response:
+            body = response.read(MAX + 1)
+            if len(body) > MAX:
+                raise ValueError("metrics too large")
+        for line in body.decode("utf-8", "replace").splitlines():
+            if not line or line.startswith("#"):
+                continue
+            ends = [i for i in (line.find("{"), line.find(" "), line.find("\t")) if i >= 0]
+            if not ends:
+                continue
+            name = line[:min(ends)]
+            try:
+                value = float(line.split()[-1])
+            except (ValueError, IndexError):
+                continue
+            if not math.isfinite(value):
+                continue
+            if name in GENERATED:
+                add(metrics, "generated", value)
+            if name in PROMPT:
+                add(metrics, "prompt", value)
+            if name in ACTIVE:
+                add(metrics, "active", value)
+            if name in QUEUED:
+                add(metrics, "queued", value)
+            if name == "sglang:gen_throughput":
+                metrics["native"] = max(0.0, value)
+            if name == "nv_trt_llm_runtime_metrics":
+                if 'metric_type="num_requests_running"' in line:
+                    add(metrics, "active", value)
+                elif 'metric_type="num_requests_waiting"' in line:
+                    add(metrics, "queued", value)
+    except Exception:
+        pass
+    return harness, endpoint, pid, metrics
+
+def esc(value):
+    return str(value).replace("%", "%25").replace("|", "%7C").replace("\r", "").replace("\n", "")
+
+servers = resolve_container_ports(discover())
+with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(servers) or 1)) as pool:
+    for harness, endpoint, pid, metrics in pool.map(scrape, servers):
+        fields = [metrics.get(k, -1) for k in ("active", "queued", "prompt", "generated", "native")]
+        print("inference=%s|%s|%d|%s" % (esc(harness), esc(endpoint), pid, "|".join("%.6f" % v for v in fields)))
+PY
+)
+fi
+
 # --- frame --------------------------------------------------------------
 printf 'CCC/1\n'
 printf 'name=%s\n' "$(escstr "$NAME")"
@@ -339,5 +554,6 @@ printf 'mem=%s\n' "$MEM"
 printf '%s\n' "$DISKS"
 printf '%s\n' "$NET"
 printf '%s\n' "$GPUS"
+printf '%s\n' "$INFERENCE"
 printf '%s\n' "$PROCS"
 printf 'end\n'

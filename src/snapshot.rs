@@ -82,6 +82,18 @@ pub struct NetRow {
     pub link_speed_mbps: Option<u32>,
 }
 
+/// One inference-server listener. Token rates are listener-wide, not per client request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InferenceSession {
+    pub harness: String,
+    pub endpoint: String,
+    pub pid: u32,
+    pub active: Option<f64>,
+    pub queued: Option<f64>,
+    pub prompt_tps: Option<f64>,
+    pub output_tps: Option<f64>,
+}
+
 /// Full telemetry frame for one station, produced every tick by a collector.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Station {
@@ -102,6 +114,7 @@ pub struct Station {
     pub disks: Vec<DiskRow>,
     pub net: Vec<NetRow>,
     pub gpus: Vec<GpuRow>,
+    pub inference: Vec<InferenceSession>,
     pub procs: Vec<ProcRow>,
 }
 

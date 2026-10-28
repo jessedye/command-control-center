@@ -6,6 +6,7 @@ mod config;
 mod deps;
 mod format;
 mod gpu;
+mod inference;
 mod kube;
 mod proto;
 mod pve;

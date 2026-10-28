@@ -7,6 +7,7 @@
 
 use crate::format;
 use crate::gpu;
+use crate::inference::{self, Baseline as InferenceBaseline};
 use crate::proto::{self, NetBaseline};
 use crate::snapshot::{DiskRow, NetRow, ProcRow, Station};
 use std::collections::HashMap;
@@ -246,6 +247,7 @@ pub struct LocalCollector {
     nets: sysinfo::Networks,
     primed: bool,
     net_base: NetBaseline,
+    inference_base: InferenceBaseline,
     prev_at: Instant,
     /// Cached `/etc/passwd` uid -> username (parsed once per process).
     users: HashMap<String, String>,
@@ -261,6 +263,7 @@ impl LocalCollector {
             nets,
             primed: false,
             net_base: NetBaseline::new(),
+            inference_base: InferenceBaseline::new(),
             prev_at: Instant::now(),
             users: passwd_users(),
         }
@@ -302,6 +305,8 @@ impl LocalCollector {
                 .map(|(name, data)| (name.clone(), data.total_received(), data.total_transmitted()))
                 .collect();
             self.net_base.commit(&c0);
+            self.inference_base
+                .commit(&inference::sample(&inference_processes(&self.sys)));
             self.prev_at = Instant::now();
             self.primed = true;
             std::thread::sleep(std::time::Duration::from_millis(900));
@@ -330,6 +335,10 @@ impl LocalCollector {
             .into_iter()
             .map(|r| NetRow { link_speed_mbps: link_speed_linux(&r.iface), ..r })
             .collect();
+
+        let inference_counters = inference::sample(&inference_processes(&self.sys));
+        let inference = self.inference_base.rates(dt, &inference_counters);
+        self.inference_base.commit(&inference_counters);
 
         let mem_total = self.sys.total_memory();
         // Skip kernel helper threads (argv-less, pegged at 0% by construction in practice):
@@ -371,9 +380,21 @@ impl LocalCollector {
             disks: disks_local(),
             net,
             gpus: gpu::detect_local(),
+            inference,
             procs,
         }
     }
+}
+
+fn inference_processes(sys: &System) -> Vec<inference::Process> {
+    sys.processes()
+        .values()
+        .filter(|p| !p.cmd().is_empty())
+        .map(|p| inference::Process {
+            pid: p.pid().as_u32(),
+            args: p.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect(),
+        })
+        .collect()
 }
 
 /// Max process rows retained per sort key; CLI clamps `--top` to 40, 48 leaves headroom.
@@ -563,6 +584,7 @@ pub struct RemoteCollector {
     /// plain key-based ssh via BatchMode; Some switches to sshpass + accept-new host keys.
     pub pass_file: Option<String>,
     net_base: NetBaseline,
+    inference_base: InferenceBaseline,
     prev_at: Instant,
 }
 
@@ -663,7 +685,16 @@ impl RemoteCollector {
             "-o".to_string(),
             "ControlPersist=300".to_string(),
         ]);
-        Self { label, host, ssh_args, pass_file, net_base: NetBaseline::new(), prev_at: Instant::now(), retry_ms }
+        Self {
+            label,
+            host,
+            ssh_args,
+            pass_file,
+            net_base: NetBaseline::new(),
+            inference_base: InferenceBaseline::new(),
+            prev_at: Instant::now(),
+            retry_ms,
+        }
     }
 
     pub fn sample(&mut self) -> Result<Station, String> {
@@ -672,14 +703,16 @@ impl RemoteCollector {
         // Round-2 finding 6: one strict parse yields BOTH the station and exactly the
         // cumulative counters that frame carried — no second pass over raw text, so bytes
         // after `end` can never merge into this sample.
-        let proto::Frame { mut station, counters } = proto::parse(&text)
+        let proto::Frame { mut station, counters, inference } = proto::parse(&text)
             .map_err(|e| format!("{}: {e}", self.label))?;
         // Rate window spans whole sampling cycles (ssh round-trip included), fractionally.
         let dt = self.prev_at.elapsed().as_secs_f64();
         station.net = self.net_base.peek(dt, &counters);
+        station.inference = self.inference_base.rates(dt, &inference);
         // Commit the baseline only when the frame decoded (review fix #13): a corrupt frame
         // must not poison the next interval's counter baseline.
         self.net_base.commit(&counters);
+        self.inference_base.commit(&inference);
         self.prev_at = Instant::now();
         if station.name.trim().is_empty() {
             station.name = self.label.clone();

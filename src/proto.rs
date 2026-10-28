@@ -22,10 +22,12 @@
 //! net=<iface>|<rx_bytes_cumulative>|<tx_bytes_cumulative>   # deltas computed receiver-side
 //! gpu=nvidia|<name>|<vram_used_mib|-1>|<vram_total_mib|-1>|<util_pct>|<temp_c|-1>
 //! The -1 sentinels mark "driver reports N/A" (integrated GPUs with unified memory).
+//! inference=<harness>|<endpoint>|<pid>|<active|-1>|<queued|-1>|<prompt_total|-1>|<generated_total|-1>|<native_tok_s|-1>
 //! proc=<pid>|<comm>|<user>|<cpu_pct>|<mem_pct>|<rss_kb>|<elapsed_s>|<cmd...>
 //! end
 //! ```
 
+use crate::inference::Counter as InferenceCounter;
 use crate::snapshot::{DiskRow, GpuRow, GpuVendor, NetRow, ProcRow, Station};
 
 pub const PROTO_MAGIC: &str = "CCC/1";
@@ -86,6 +88,7 @@ impl Default for NetBaseline {
 pub struct Frame {
     pub station: Station,
     pub counters: Vec<(String, u64, u64)>,
+    pub inference: Vec<InferenceCounter>,
 }
 
 /// Parse a full CCC/1 transcript, validating every field (no defaults-on-garbage). Use
@@ -108,9 +111,11 @@ pub fn parse(text: &str) -> Result<Frame, String> {
         disks: Vec::new(),
         net: Vec::new(),
         gpus: Vec::new(),
+        inference: Vec::new(),
         procs: Vec::new(),
     };
     let mut counters: Vec<(String, u64, u64)> = Vec::new();
+    let mut inference: Vec<InferenceCounter> = Vec::new();
     // Review fix #13 — strict frame integrity:
     //   * magic must open the frame; data keys before it are a framing bug, not noise
     //   * `end` closes the frame; trailing bytes after it are ignored (never merged in)
@@ -149,7 +154,7 @@ pub fn parse(text: &str) -> Result<Frame, String> {
         let known = matches!(
             key,
             "name" | "ts" | "os" | "kernel" | "up" | "load" | "cores" | "cpu" | "cpus"
-                | "mem" | "disk" | "net" | "gpu" | "proc"
+                | "mem" | "disk" | "net" | "gpu" | "inference" | "proc"
         );
         if !seen_magic && known {
             return Err(format!("'{key}' field appears before {PROTO_MAGIC} magic"));
@@ -238,6 +243,23 @@ pub fn parse(text: &str) -> Result<Frame, String> {
                     temp_c: opt_temp(f[5]),
                 });
             }
+            "inference" => {
+                let f: Vec<&str> = val.split('|').collect();
+                if f.len() != 8 {
+                    return Err(format!("inference row needs 8 fields, got {}: {val}", f.len()));
+                }
+                inference.push(InferenceCounter {
+                    harness: sanitize(&unhex(f[0].trim())),
+                    endpoint: sanitize(&unhex(f[1].trim())),
+                    connect_host: String::new(),
+                    pid: num_u64("inference", f[2])?.min(u32::MAX as u64) as u32,
+                    active: opt_vram("inference", f[3])?,
+                    queued: opt_vram("inference", f[4])?,
+                    prompt_total: opt_vram("inference", f[5])?,
+                    generated_total: opt_vram("inference", f[6])?,
+                    native_tps: opt_vram("inference", f[7])?,
+                });
+            }
             "proc" => {
                 let f: Vec<&str> = val.splitn(8, '|').collect();
                 if f.len() != 8 {
@@ -266,7 +288,7 @@ pub fn parse(text: &str) -> Result<Frame, String> {
     if !ended {
         return Err(format!("truncated stream, missing 'end'; raw tail: {:?}", trim_tail(text, 160)));
     }
-    Ok(Frame { station: st, counters })
+    Ok(Frame { station: st, counters, inference })
 }
 
 /// Strip ASCII control characters from decoded strings. Remote process ARGV, labels, and
@@ -432,6 +454,7 @@ disk=/boot|vfat|1048576000|534773760|534773760
 net=eth0|123456789|987654321
 gpu=nvidia|RTX 6000 Ada Generation|15834|49140|63|57
 gpu=amdgpu|AMD Radeon|1024|16384|31|-1
+inference=vLLM|127.0.0.1:8000|2481|2|3|500|150|-1
 proc=2481|python3|jesse|63.1|1.2|862412|12345|python3 %2Dm http%2Dserver
 end
 ";
@@ -460,6 +483,14 @@ end
         // Round-2 finding 6: counters come from INSIDE the parsed frame, typed strictly.
         let f = parse(SAMPLE).expect("frame parses");
         assert_eq!(f.counters, vec![("eth0".to_string(), 123_456_789u64, 987_654_321u64)]);
+        assert_eq!(f.inference.len(), 1);
+        assert_eq!(f.inference[0].harness, "vLLM");
+        assert_eq!(f.inference[0].endpoint, "127.0.0.1:8000");
+        assert_eq!(f.inference[0].active, Some(2.0));
+        assert_eq!(f.inference[0].queued, Some(3.0));
+        assert_eq!(f.inference[0].prompt_total, Some(500.0));
+        assert_eq!(f.inference[0].generated_total, Some(150.0));
+        assert_eq!(f.inference[0].native_tps, None);
     }
 
     #[test]
@@ -510,6 +541,8 @@ end
         assert!(decode("CCC/1\nmem=100 BAD 20 10\nend\n").is_err());
         // Malformed net counter values poison baselines as 0; reject at grammar level.
         assert!(parse("CCC/1\nnet=eth0|BAD|1\nend\n").is_err());
+        assert!(parse("CCC/1\ninference=vLLM|127.0.0.1:8000|1|2|-1|10|BAD|-1\nend\n").is_err());
+        assert!(parse("CCC/1\ninference=vLLM|short\nend\n").is_err());
         // Non-finite numbers are rejected (Rust parses "inf"/"NaN" happily).
         assert!(decode("CCC/1\nname=a\ncpu=inf\nend\n").is_err());
         assert!(decode("CCC/1\nname=a\nload=1 nan 3\nend\n").is_err());

@@ -1,7 +1,7 @@
 //! Discovery and listener-wide token rates for local AI inference servers.
 
 use crate::snapshot::InferenceSession;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
@@ -42,9 +42,33 @@ struct Metrics {
     native_tps: Option<f64>,
 }
 
+const RATE_WINDOW_SECS: f64 = 5.0;
+
+#[derive(Clone, Copy)]
+struct CounterPoint {
+    dt: f64,
+    prompt: Option<f64>,
+    generated: Option<f64>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RateStats {
+    average: Option<f64>,
+    minimum: Option<f64>,
+    maximum: Option<f64>,
+}
+
+impl RateStats {
+    fn native(value: Option<f64>) -> Self {
+        Self { average: value, minimum: value, maximum: value }
+    }
+}
+
 #[derive(Default)]
 pub struct Baseline {
-    previous: HashMap<String, (Option<f64>, Option<f64>)>,
+    history: HashMap<String, VecDeque<CounterPoint>>,
+    missed_dt: HashMap<String, f64>,
+    last_rates: HashMap<String, (RateStats, RateStats)>,
 }
 
 impl Baseline {
@@ -52,16 +76,83 @@ impl Baseline {
         Self::default()
     }
 
+    fn window_rate(
+        &self,
+        key: &str,
+        dt: f64,
+        current: Option<f64>,
+        select: fn(&CounterPoint) -> Option<f64>,
+    ) -> Option<f64> {
+        let now = current?;
+        let history = self.history.get(key)?;
+        let mut elapsed = dt + self.missed_dt.get(key).copied().unwrap_or(0.0);
+        let mut oldest = None;
+        for point in history.iter().rev() {
+            oldest = select(point);
+            if elapsed >= RATE_WINDOW_SECS {
+                break;
+            }
+            elapsed += point.dt.max(0.0);
+        }
+        let old = oldest?;
+        (elapsed > 0.0 && now >= old).then_some((now - old) / elapsed)
+    }
+
+    fn window_stats(
+        &self,
+        key: &str,
+        dt: f64,
+        current: Option<f64>,
+        select: fn(&CounterPoint) -> Option<f64>,
+    ) -> RateStats {
+        let average = self.window_rate(key, dt, current, select);
+        let mut intervals = Vec::new();
+        if let (Some(now), Some(history)) = (current, self.history.get(key)) {
+            let dt = dt + self.missed_dt.get(key).copied().unwrap_or(0.0);
+            if let Some(old) = history.back().and_then(select) {
+                if dt > 0.0 && now >= old {
+                    intervals.push((now - old) / dt);
+                }
+            }
+            let mut covered = dt;
+            for index in (1..history.len()).rev() {
+                if covered >= RATE_WINDOW_SECS {
+                    break;
+                }
+                let newer = history[index];
+                let older = history[index - 1];
+                if let (Some(new), Some(old)) = (select(&newer), select(&older)) {
+                    if newer.dt > 0.0 && new >= old {
+                        intervals.push((new - old) / newer.dt);
+                    }
+                }
+                covered += newer.dt.max(0.0);
+            }
+        }
+        let minimum = intervals.iter().copied().reduce(f64::min);
+        let maximum = intervals.iter().copied().reduce(f64::max);
+        RateStats { average, minimum, maximum }
+    }
+
     pub fn rates(&self, dt_secs: f64, counters: &[Counter]) -> Vec<InferenceSession> {
         counters
             .iter()
             .map(|c| {
                 let key = counter_key(c);
-                let previous = self.previous.get(&key);
-                let rate = |current: Option<f64>, before: Option<Option<f64>>| {
-                    let now = current?;
-                    let old = before??;
-                    (dt_secs > 0.0 && now >= old).then_some((now - old) / dt_secs)
+                let previous = self.last_rates.get(&key).copied().unwrap_or_default();
+                let missed = self.missed_dt.get(&key).copied().unwrap_or(0.0) + dt_secs;
+                let prompt = match c.prompt_total {
+                    Some(_) => self.window_stats(&key, dt_secs, c.prompt_total, |p| p.prompt),
+                    None if missed <= RATE_WINDOW_SECS => previous.0,
+                    None => RateStats::default(),
+                };
+                let output = match c.generated_total {
+                    Some(_) => {
+                        let stats = self.window_stats(&key, dt_secs, c.generated_total, |p| p.generated);
+                        if stats.average.is_some() { stats } else { RateStats::native(c.native_tps) }
+                    }
+                    None if missed <= RATE_WINDOW_SECS && c.native_tps.is_none() => previous.1,
+                    None => RateStats::native(c.native_tps),
                 };
                 InferenceSession {
                     harness: c.harness.clone(),
@@ -69,18 +160,55 @@ impl Baseline {
                     pid: c.pid,
                     active: c.active,
                     queued: c.queued,
-                    prompt_tps: rate(c.prompt_total, previous.map(|p| p.0)),
-                    output_tps: rate(c.generated_total, previous.map(|p| p.1)).or(c.native_tps),
+                    prompt_tps: prompt.average,
+                    prompt_min_tps: prompt.minimum,
+                    prompt_max_tps: prompt.maximum,
+                    output_tps: output.average,
+                    output_min_tps: output.minimum,
+                    output_max_tps: output.maximum,
                 }
             })
             .collect()
     }
 
-    pub fn commit(&mut self, counters: &[Counter]) {
-        self.previous = counters
-            .iter()
-            .map(|c| (counter_key(c), (c.prompt_total, c.generated_total)))
-            .collect();
+    pub fn commit(&mut self, dt_secs: f64, counters: &[Counter]) {
+        let rates = self.rates(dt_secs, counters);
+        for (c, row) in counters.iter().zip(rates) {
+            let key = counter_key(c);
+            if c.prompt_total.is_none() && c.generated_total.is_none() {
+                *self.missed_dt.entry(key).or_insert(0.0) += dt_secs.max(0.0);
+                continue;
+            }
+            let dt = dt_secs.max(0.0) + self.missed_dt.remove(&key).unwrap_or(0.0);
+            let history = self.history.entry(key.clone()).or_default();
+            let reset = history.back().is_some_and(|previous| {
+                c.prompt_total.zip(previous.prompt).is_some_and(|(now, old)| now < old)
+                    || c.generated_total.zip(previous.generated).is_some_and(|(now, old)| now < old)
+            });
+            if reset {
+                history.clear();
+            }
+            history.push_back(CounterPoint { dt, prompt: c.prompt_total, generated: c.generated_total });
+            while history.len() > 1 {
+                let total: f64 = history.iter().map(|point| point.dt.max(0.0)).sum();
+                let oldest = history.front().map(|point| point.dt.max(0.0)).unwrap_or(0.0);
+                if total - oldest < RATE_WINDOW_SECS {
+                    break;
+                }
+                history.pop_front();
+            }
+            let previous = self.last_rates.entry(key).or_default();
+            if c.prompt_total.is_some() {
+                previous.0 = RateStats { average: row.prompt_tps, minimum: row.prompt_min_tps, maximum: row.prompt_max_tps };
+            }
+            if c.generated_total.is_some() || c.native_tps.is_some() {
+                previous.1 = RateStats { average: row.output_tps, minimum: row.output_min_tps, maximum: row.output_max_tps };
+            }
+        }
+        let live: Vec<String> = counters.iter().map(counter_key).collect();
+        self.history.retain(|key, _| live.contains(key));
+        self.missed_dt.retain(|key, _| live.contains(key));
+        self.last_rates.retain(|key, _| live.contains(key));
     }
 }
 
@@ -486,15 +614,59 @@ mod tests {
             pid: 1, active: Some(1.0), queued: None, prompt_total: Some(10.0), generated_total: Some(20.0), native_tps: None,
         };
         assert_eq!(baseline.rates(1.0, &[counter.clone()])[0].output_tps, None);
-        baseline.commit(&[counter.clone()]);
+        baseline.commit(0.0, &[counter.clone()]);
         counter.generated_total = Some(80.0);
         counter.prompt_total = Some(40.0);
         let rows = baseline.rates(2.0, &[counter.clone()]);
         assert_eq!(rows[0].output_tps, Some(30.0));
         assert_eq!(rows[0].prompt_tps, Some(15.0));
-        baseline.commit(&[counter.clone()]);
+        baseline.commit(2.0, &[counter.clone()]);
         counter.generated_total = Some(2.0);
         assert_eq!(baseline.rates(1.0, &[counter])[0].output_tps, None);
+    }
+
+    #[test]
+    fn rolling_window_smooths_idle_ticks_and_missed_scrapes() {
+        let mut baseline = Baseline::new();
+        let mut counter = Counter {
+            harness: "vLLM".into(), endpoint: "127.0.0.1:8000".into(), connect_host: "127.0.0.1".into(),
+            pid: 1, active: Some(1.0), queued: None, prompt_total: Some(0.0), generated_total: Some(0.0), native_tps: None,
+        };
+        baseline.commit(0.0, &[counter.clone()]);
+        counter.generated_total = Some(100.0);
+        let active = baseline.rates(1.0, &[counter.clone()]);
+        assert_eq!(active[0].output_tps, Some(100.0));
+        baseline.commit(1.0, &[counter.clone()]);
+        let idle = baseline.rates(1.0, &[counter.clone()]);
+        assert_eq!(idle[0].output_tps, Some(50.0));
+        assert_eq!(idle[0].output_min_tps, Some(0.0));
+        assert_eq!(idle[0].output_max_tps, Some(100.0));
+        baseline.commit(1.0, &[counter.clone()]);
+        counter.prompt_total = None;
+        counter.generated_total = None;
+        assert_eq!(baseline.rates(1.0, &[counter.clone()])[0].output_tps, Some(50.0));
+        baseline.commit(1.0, &[counter.clone()]);
+        counter.prompt_total = Some(0.0);
+        counter.generated_total = Some(100.0);
+        assert_eq!(baseline.rates(1.0, &[counter])[0].output_tps, Some(25.0));
+    }
+
+    #[test]
+    fn rolling_rate_is_independent_of_sample_interval() {
+        let mut baseline = Baseline::new();
+        let mut counter = Counter {
+            harness: "vLLM".into(), endpoint: "127.0.0.1:8000".into(), connect_host: "127.0.0.1".into(),
+            pid: 1, active: Some(1.0), queued: None, prompt_total: Some(0.0), generated_total: Some(0.0), native_tps: None,
+        };
+        baseline.commit(0.0, &[counter.clone()]);
+        for _ in 0..12 {
+            counter.generated_total = Some(counter.generated_total.unwrap() + 100.0);
+            let rows = baseline.rates(2.0, &[counter.clone()]);
+            assert_eq!(rows[0].output_tps, Some(50.0));
+            assert_eq!(rows[0].output_min_tps, Some(50.0));
+            assert_eq!(rows[0].output_max_tps, Some(50.0));
+            baseline.commit(2.0, &[counter.clone()]);
+        }
     }
 
     #[test]
@@ -526,7 +698,7 @@ mod tests {
         let second = sample(&[process]);
         server.join().unwrap();
         let mut baseline = Baseline::new();
-        baseline.commit(&first);
+        baseline.commit(0.0, &first);
         let rows = baseline.rates(2.0, &second);
         assert_eq!(rows[0].output_tps, Some(30.0));
     }

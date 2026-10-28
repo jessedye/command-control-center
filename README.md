@@ -112,8 +112,10 @@ knobs, troubleshooting — is in the [setup guide](docs/SETUP.md).
 ## What's on screen
 
 - **Overview** (tab 1) — the consolidated fleet board: one row per station with cpu / mem /
-  nvram / load / disk, colored by threshold, plus PVE cluster rows showing hypervisors
-  online and guests running. Station tabs then show *only* their own detail panels.
+  nvram / load / disk / current AI output tokens/sec, colored by threshold, plus PVE cluster rows showing hypervisors
+  online and guests running. An aligned AI INFERENCE table adds active sessions, listeners,
+  queued requests, fleet totals, per-active-session averages, and five-second avg/min/max
+  input/output rates per station. Station tabs then show *only* their own detail panels.
   Configure placement with `summary overview|all|off` in the config file.
 - **Right rail** — fleet-wide CPU / MEM / NVRAM / DISK bars, color-banded against
   `--warn` / `--crit`.
@@ -124,12 +126,13 @@ knobs, troubleshooting — is in the [setup guide](docs/SETUP.md).
   memory (DGX Spark's GB10, other SoC GPUs) still render fully: utilization + temperature
   plus unified-memory usage as the sum of CUDA process allocations over host RAM.
 - **AI SESSIONS** — every discovered inference-server listener on the station, with active
-  and queued requests plus input/output tokens/sec. Auto-detects **vLLM, SGLang, Hugging
+  and queued requests plus five-second average/minimum/maximum input and output tokens/sec. Auto-detects **vLLM, SGLang, Hugging
   Face TGI, TensorRT-LLM/Triton, Ollama, llama.cpp (`llama-server`), and LMDeploy**, including
   custom `--port`/`--host` arguments and multiple listeners. Containerized servers are followed
   through their published Docker/Podman ports. Rates come from each listener's loopback
-  `/metrics` counters over the real sample interval (or its native throughput gauge
-  when counters are unavailable). These are listener-wide totals, not separate client-request
+  `/metrics` counters over a rolling five-second window (or its native throughput gauge
+  when counters are unavailable). Brief scrape failures do not immediately reset the rate.
+  These are listener-wide totals, not separate client-request
   sessions. The first sample and harnesses that do not export a metric show `—`, never a fake
   zero. Remote discovery uses `python3`'s standard library when present; no package, agent,
   credentials, or remote file installation is needed, and other telemetry is unaffected when

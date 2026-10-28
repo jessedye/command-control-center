@@ -824,26 +824,14 @@ fn fleet_chips(view: &View, with_disk: bool) -> Vec<Row> {
                     // glance needs disk too, not just cpu/mem/nvram/load.
                     tail.push_str(&format!("  disk {:>4.0}%", disk_max_pct(h)));
                     if !h.inference.is_empty() {
-                        let (sums, known) = h.inference.iter().fold(([0.0; 6], [false; 6]), |(mut sums, mut known), session| {
-                            let values = [
-                                session.prompt_tps, session.prompt_min_tps, session.prompt_max_tps,
-                                session.output_tps, session.output_min_tps, session.output_max_tps,
-                            ];
-                            for (index, value) in values.into_iter().enumerate() {
-                                if let Some(value) = value {
-                                    sums[index] += value;
-                                    known[index] = true;
-                                }
-                            }
-                            (sums, known)
+                        let (total, known) = h.inference.iter().fold((0.0, false), |(sum, known), session| {
+                            (sum + session.output_tps.unwrap_or(0.0), known || session.output_tps.is_some())
                         });
-                        let cell = |index: usize| {
-                            if known[index] { format!("{:.1}", sums[index]) } else { "—".into() }
-                        };
-                        tail.push_str(&format!(
-                            "  ai avg {}/{}  min {}/{}  max {}/{} tok/s",
-                            cell(0), cell(3), cell(1), cell(4), cell(2), cell(5)
-                        ));
+                        if known {
+                            tail.push_str(&format!("  ai {total:.1} tok/s"));
+                        } else {
+                            tail.push_str("  ai — tok/s");
+                        }
                     }
                 }
                 (l, tail)
@@ -877,6 +865,129 @@ fn fleet_chips(view: &View, with_disk: bool) -> Vec<Row> {
             seg(tail, lamp_st),
         ]);
     }
+    rows
+}
+
+fn inference_overview(view: &View) -> Vec<Row> {
+    if !view.stations.get(view.focus).is_some_and(|s| s.label == OVERVIEW_LABEL) {
+        return Vec::new();
+    }
+    let stations: Vec<_> = view.stations.iter().filter_map(|station| {
+        let host = station.host.filter(|host| !host.inference.is_empty())?;
+        Some((station.title(), host))
+    }).collect();
+    if stations.is_empty() {
+        return Vec::new();
+    }
+    let listeners: usize = stations.iter().map(|(_, host)| host.inference.len()).sum();
+    let (active, active_known) = stations.iter().fold((0.0, false), |(sum, known), (_, host)| {
+        host.inference.iter().fold((sum, known), |(sum, known), session| {
+            (sum + session.active.unwrap_or(0.0), known || session.active.is_some())
+        })
+    });
+    let active_title = if active_known { format!("{active:.0}") } else { "—".into() };
+    let mut rows = vec![
+        vec![
+            seg("AI INFERENCE ", St::Head),
+            seg(format!(
+                "· {active_title} active session{} · {listeners} listener{} · 5s avg/min/max",
+                if active == 1.0 { "" } else { "s" },
+                if listeners == 1 { "" } else { "s" }
+            ), St::Dim),
+        ],
+        vec![seg(format!(
+            "{:<14} {:<9} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+            "STATION", "LISTENERS", "ACTIVE", "QUEUED", "IN AVG", "IN MIN", "IN MAX", "OUT AVG", "OUT MIN", "OUT MAX"
+        ), St::Dim)],
+    ];
+    for (label, host) in &stations {
+        let gauge = |active: bool| host.inference.iter().fold((0.0, false), |(sum, known), session| {
+            let value = if active { session.active } else { session.queued };
+            (sum + value.unwrap_or(0.0), known || value.is_some())
+        });
+        let (active, active_known) = gauge(true);
+        let (queued, queued_known) = gauge(false);
+        let integer = |value: f64, known: bool| if known { format!("{value:.0}") } else { "—".into() };
+        let (sums, known) = host.inference.iter().fold(([0.0; 6], [false; 6]), |(mut sums, mut known), session| {
+            let values = [
+                session.prompt_tps, session.prompt_min_tps, session.prompt_max_tps,
+                session.output_tps, session.output_min_tps, session.output_max_tps,
+            ];
+            for (index, value) in values.into_iter().enumerate() {
+                if let Some(value) = value {
+                    sums[index] += value;
+                    known[index] = true;
+                }
+            }
+            (sums, known)
+        });
+        let cell = |index: usize| if known[index] { format!("{:.1}", sums[index]) } else { "—".into() };
+        rows.push(vec![
+            seg(format!("{:<14} ", trunc_cell(&label, 14)), St::Ident),
+            seg(format!("{:<9} ", host.inference.len()), St::Dim),
+            seg(format!("{:>7} ", integer(active, active_known)), St::Normal),
+            seg(format!("{:>7} ", integer(queued, queued_known)), St::Normal),
+            seg(format!("{:>8} ", cell(0)), St::Normal),
+            seg(format!("{:>8} ", cell(1)), St::Dim),
+            seg(format!("{:>8} ", cell(2)), St::Normal),
+            seg(format!("{:>8} ", cell(3)), St::Ident),
+            seg(format!("{:>8} ", cell(4)), St::Dim),
+            seg(format!("{:>8}", cell(5)), St::Ident),
+        ]);
+    }
+    let (sums, known) = stations.iter().fold(([0.0; 6], [false; 6]), |(mut sums, mut known), (_, host)| {
+        for session in &host.inference {
+            let values = [
+                session.prompt_tps, session.prompt_min_tps, session.prompt_max_tps,
+                session.output_tps, session.output_min_tps, session.output_max_tps,
+            ];
+            for (index, value) in values.into_iter().enumerate() {
+                if let Some(value) = value {
+                    sums[index] += value;
+                    known[index] = true;
+                }
+            }
+        }
+        (sums, known)
+    });
+    let (queued, queued_known) = stations.iter().fold((0.0, false), |(sum, known), (_, host)| {
+        host.inference.iter().fold((sum, known), |(sum, known), session| {
+            (sum + session.queued.unwrap_or(0.0), known || session.queued.is_some())
+        })
+    });
+    let summary_row = |label: &str, listeners: String, active: String, queued: String, values: [f64; 6], available: [bool; 6], scale: f64| {
+        let cell = |index: usize| if available[index] { format!("{:.1}", values[index] / scale) } else { "—".into() };
+        vec![
+            seg(format!("{label:<14} "), St::Ident),
+            seg(format!("{listeners:<9} "), St::Dim),
+            seg(format!("{active:>7} "), St::Normal),
+            seg(format!("{queued:>7} "), St::Normal),
+            seg(format!("{:>8} ", cell(0)), St::Normal),
+            seg(format!("{:>8} ", cell(1)), St::Dim),
+            seg(format!("{:>8} ", cell(2)), St::Normal),
+            seg(format!("{:>8} ", cell(3)), St::Ident),
+            seg(format!("{:>8} ", cell(4)), St::Dim),
+            seg(format!("{:>8}", cell(5)), St::Ident),
+        ]
+    };
+    rows.push(summary_row(
+        "TOTAL",
+        listeners.to_string(),
+        if active_known { format!("{active:.0}") } else { "—".into() },
+        if queued_known { format!("{queued:.0}") } else { "—".into() },
+        sums,
+        known,
+        1.0,
+    ));
+    rows.push(summary_row(
+        "PER SESSION",
+        "—".into(),
+        "—".into(),
+        "—".into(),
+        sums,
+        if active_known && active > 0.0 { known } else { [false; 6] },
+        if active > 0.0 { active } else { 1.0 },
+    ));
     rows
 }
 
@@ -1458,6 +1569,9 @@ pub fn build_rows(view: &View) -> Vec<Row> {
             out.push((P_CHIP, false, r));
         }
     }
+    for (i, r) in inference_overview(view).into_iter().enumerate() {
+        out.push((if i < 2 { P_STRUCT } else { P_BODY }, i < 2, r));
+    }
     for (i, r) in kube_table(view).into_iter().enumerate() {
         out.push((if i == 0 { P_STRUCT } else { P_KUBE_ROW }, i == 0, r));
     }
@@ -1818,7 +1932,18 @@ mod fleet_render_tests {
         ];
         let overview = to_plain(&build_rows(&view)).join("\n");
         let dgx = overview.lines().find(|line| line.contains("DGX1") && line.contains("cpu")).unwrap();
-        assert!(dgx.contains("ai avg 120.4/76.8  min 0.0/10.0  max 200.0/90.0 tok/s"), "{overview}");
+        assert!(dgx.contains("ai 76.8 tok/s"), "{overview}");
+        assert!(overview.contains("AI INFERENCE · 3 active sessions · 2 listeners"), "{overview}");
+        let stats = overview.lines().find(|line| line.contains("DGX1") && line.contains("120.4")).unwrap();
+        for probe in ["2", "3", "2", "120.4", "0.0", "200.0", "76.8", "10.0", "90.0"] {
+            assert!(stats.contains(probe), "missing {probe}: {stats}");
+        }
+        let total = overview.lines().find(|line| line.starts_with("TOTAL")).unwrap();
+        assert!(total.contains("120.4") && total.contains("76.8"), "{total}");
+        let per_session = overview.lines().find(|line| line.starts_with("PER SESSION")).unwrap();
+        for probe in ["40.1", "66.7", "25.6", "3.3", "30.0"] {
+            assert!(per_session.contains(probe), "missing {probe}: {per_session}");
+        }
     }
 
     #[test]

@@ -128,8 +128,9 @@ knobs, troubleshooting — is in the [setup guide](docs/SETUP.md).
   Face TGI, TensorRT-LLM/Triton, Ollama, llama.cpp (`llama-server`), and LMDeploy**, including
   custom `--port`/`--host` arguments and multiple listeners. Containerized servers are followed
   through their published Docker/Podman ports. Rates come from each listener's loopback
-  `/metrics` counters over the real sample interval (or its native throughput gauge
-  when counters are unavailable). These are listener-wide totals, not separate client-request
+  `/metrics` counters over a rolling five-second window (or its native throughput gauge
+  when counters are unavailable). Brief scrape failures do not immediately reset the rate.
+  These are listener-wide totals, not separate client-request
   sessions. The first sample and harnesses that do not export a metric show `—`, never a fake
   zero. Remote discovery uses `python3`'s standard library when present; no package, agent,
   credentials, or remote file installation is needed, and other telemetry is unaffected when

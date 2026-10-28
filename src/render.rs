@@ -699,7 +699,7 @@ fn inference_panel(h: &Station, max_rows: usize) -> Vec<Row> {
         vec![
             seg("AI SESSIONS ", St::Head),
             seg(format!("· {} listener{}", h.inference.len(), if h.inference.len() == 1 { "" } else { "s" }), St::Dim),
-            seg("  (listener-wide rates)", St::Dim),
+            seg("  (5s average, listener-wide)", St::Dim),
         ],
         vec![seg(format!(
             "{:<14} {:<23} {:>7} {:>6} {:>6} {:>11} {:>11}",

@@ -820,17 +820,23 @@ fn fleet_chips(view: &View, with_disk: bool) -> Vec<Row> {
                     // glance needs disk too, not just cpu/mem/nvram/load.
                     tail.push_str(&format!("  disk {:>4.0}%", disk_max_pct(h)));
                     if !h.inference.is_empty() {
-                        let (total, known) = h.inference.iter().fold((0.0, false), |(sum, known), session| {
-                            match session.output_tps {
-                                Some(rate) => (sum + rate, true),
-                                None => (sum, known),
-                            }
-                        });
-                        if known {
-                            tail.push_str(&format!("  ai {total:.1} tok/s"));
-                        } else {
-                            tail.push_str("  ai — tok/s");
-                        }
+                        let (input, output, input_known, output_known) = h.inference.iter().fold(
+                            (0.0, 0.0, false, false),
+                            |(input, output, input_known, output_known), session| {
+                                (
+                                    input + session.prompt_tps.unwrap_or(0.0),
+                                    output + session.output_tps.unwrap_or(0.0),
+                                    input_known || session.prompt_tps.is_some(),
+                                    output_known || session.output_tps.is_some(),
+                                )
+                            },
+                        );
+                        let cell = |value: Option<f64>| {
+                            value.map(|rate| format!("{rate:.1}")).unwrap_or_else(|| "—".into())
+                        };
+                        let input = input_known.then_some(input);
+                        let output = output_known.then_some(output);
+                        tail.push_str(&format!("  ai {}/{} tok/s", cell(input), cell(output)));
                     }
                 }
                 (l, tail)
@@ -1801,7 +1807,7 @@ mod fleet_render_tests {
         ];
         let overview = to_plain(&build_rows(&view)).join("\n");
         let dgx = overview.lines().find(|line| line.contains("DGX1") && line.contains("cpu")).unwrap();
-        assert!(dgx.contains("ai 76.8 tok/s"), "{overview}");
+        assert!(dgx.contains("ai 120.4/76.8 tok/s"), "{overview}");
     }
 
     #[test]

@@ -819,6 +819,19 @@ fn fleet_chips(view: &View, with_disk: bool) -> Vec<Row> {
                     // Overview tab is the consolidated dashboard owner asked for: one
                     // glance needs disk too, not just cpu/mem/nvram/load.
                     tail.push_str(&format!("  disk {:>4.0}%", disk_max_pct(h)));
+                    if !h.inference.is_empty() {
+                        let (total, known) = h.inference.iter().fold((0.0, false), |(sum, known), session| {
+                            match session.output_tps {
+                                Some(rate) => (sum + rate, true),
+                                None => (sum, known),
+                            }
+                        });
+                        if known {
+                            tail.push_str(&format!("  ai {total:.1} tok/s"));
+                        } else {
+                            tail.push_str("  ai — tok/s");
+                        }
+                    }
                 }
                 (l, tail)
             }
@@ -1773,6 +1786,22 @@ mod fleet_render_tests {
         assert!(text.contains("vLLM") && text.contains("127.0.0.1:8000"));
         assert!(text.contains("120.4") && text.contains("76.8"));
         assert!(text.contains("Ollama") && text.contains("—"));
+
+        view.summary = crate::config::SummaryMode::Overview;
+        view.focus = 0;
+        view.stations = vec![
+            UiStation {
+                label: OVERVIEW_LABEL.into(), host: None, err: None, pve: None, kube: None,
+                kube_pods: &[], kube_pvcs: &[], kube_note: None, hist_cpu: Vec::new(), hist_mem: Vec::new(), sample_ts: 0,
+            },
+            UiStation {
+                label: "DGX1".into(), host: Some(&host), err: None, pve: None, kube: None,
+                kube_pods: &[], kube_pvcs: &[], kube_note: None, hist_cpu: Vec::new(), hist_mem: Vec::new(), sample_ts: 0,
+            },
+        ];
+        let overview = to_plain(&build_rows(&view)).join("\n");
+        let dgx = overview.lines().find(|line| line.contains("DGX1") && line.contains("cpu")).unwrap();
+        assert!(dgx.contains("ai 76.8 tok/s"), "{overview}");
     }
 
     #[test]

@@ -689,6 +689,37 @@ fn nvram_panel(view: &View, h: &Station) -> Vec<Row> {
     rows
 }
 
+fn inference_panel(h: &Station, max_rows: usize) -> Vec<Row> {
+    if h.inference.is_empty() {
+        return Vec::new();
+    }
+    let number = |value: Option<f64>| value.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into());
+    let rate = |value: Option<f64>| value.map(|v| format!("{v:.1}")).unwrap_or_else(|| "—".into());
+    let mut rows = vec![
+        vec![
+            seg("AI SESSIONS ", St::Head),
+            seg(format!("· {} listener{}", h.inference.len(), if h.inference.len() == 1 { "" } else { "s" }), St::Dim),
+            seg("  (listener-wide rates)", St::Dim),
+        ],
+        vec![seg(format!(
+            "{:<14} {:<23} {:>7} {:>6} {:>6} {:>11} {:>11}",
+            "HARNESS", "ENDPOINT", "PID", "ACTIVE", "QUEUED", "IN TOK/S", "OUT TOK/S"
+        ), St::Dim)],
+    ];
+    for session in h.inference.iter().take(max_rows) {
+        rows.push(vec![
+            seg(format!("{:<14} ", trunc_cell(&session.harness, 14)), St::Normal),
+            seg(format!("{:<23} ", trunc_cell(&session.endpoint, 23)), St::Dim),
+            seg(format!("{:>7} ", session.pid), St::Dim),
+            seg(format!("{:>6} ", number(session.active)), St::Normal),
+            seg(format!("{:>6} ", number(session.queued)), St::Normal),
+            seg(format!("{:>11} ", rate(session.prompt_tps)), St::Normal),
+            seg(format!("{:>11}", rate(session.output_tps)), St::Ident),
+        ]);
+    }
+    rows
+}
+
 fn net_panel(_view: &View, h: &Station, iface_cap: usize) -> Vec<Row> {
     let total_rx: f64 = h.net.iter().map(|n| n.rx_bps).sum();
     let total_tx: f64 = h.net.iter().map(|n| n.tx_bps).sum();
@@ -1424,6 +1455,10 @@ pub fn build_rows(view: &View) -> Vec<Row> {
                 // NVRAM name+bar pairs: drop bars (odd rows) before name/title rows.
                 out.push((if j % 2 == 0 { P_STRUCT } else { P_BODY }, j % 2 == 0, r));
             }
+            let inference_cap = if view.verbose { usize::MAX } else { 8 };
+            for (j, r) in inference_panel(stn, inference_cap).into_iter().enumerate() {
+                out.push((if j < 2 { P_STRUCT } else { P_BODY }, j < 2, r));
+            }
             // Round-2 finding 28: --verbose must actually raise the interface cap (it used
             // to receive usize::MAX unconditionally, making the `v` key a no-op here).
             let net_cap = if view.verbose { usize::MAX } else { 8 };
@@ -1707,8 +1742,37 @@ mod fleet_render_tests {
             disks: Vec::new(),
             net: Vec::new(),
             gpus: Vec::new(),
+            inference: Vec::new(),
             procs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn inference_panel_shows_each_listener_and_token_rates() {
+        use crate::snapshot::InferenceSession;
+        let host = Station {
+            inference: vec![
+                InferenceSession {
+                    harness: "vLLM".into(), endpoint: "127.0.0.1:8000".into(), pid: 42,
+                    active: Some(3.0), queued: Some(2.0), prompt_tps: Some(120.4), output_tps: Some(76.8),
+                },
+                InferenceSession {
+                    harness: "Ollama".into(), endpoint: "127.0.0.1:11434".into(), pid: 84,
+                    active: None, queued: None, prompt_tps: None, output_tps: None,
+                },
+            ],
+            ..host_station()
+        };
+        let mut view = view_with_fleet(120, &[], &[], &[]);
+        view.stations = vec![UiStation {
+            label: "gpu".into(), host: Some(&host), err: None, pve: None, kube: None,
+            kube_pods: &[], kube_pvcs: &[], kube_note: None, hist_cpu: Vec::new(), hist_mem: Vec::new(), sample_ts: 0,
+        }];
+        let text = to_plain(&build_rows(&view)).join("\n");
+        assert!(text.contains("AI SESSIONS · 2 listeners"), "{text}");
+        assert!(text.contains("vLLM") && text.contains("127.0.0.1:8000"));
+        assert!(text.contains("120.4") && text.contains("76.8"));
+        assert!(text.contains("Ollama") && text.contains("—"));
     }
 
     #[test]

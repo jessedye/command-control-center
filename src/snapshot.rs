@@ -91,7 +91,11 @@ pub struct InferenceSession {
     pub active: Option<f64>,
     pub queued: Option<f64>,
     pub prompt_tps: Option<f64>,
+    pub prompt_min_tps: Option<f64>,
+    pub prompt_max_tps: Option<f64>,
     pub output_tps: Option<f64>,
+    pub output_min_tps: Option<f64>,
+    pub output_max_tps: Option<f64>,
 }
 
 /// Full telemetry frame for one station, produced every tick by a collector.

@@ -112,7 +112,7 @@ knobs, troubleshooting — is in the [setup guide](docs/SETUP.md).
 ## What's on screen
 
 - **Overview** (tab 1) — the consolidated fleet board: one row per station with cpu / mem /
-  nvram / load / disk / AI input/output tokens/sec, colored by threshold, plus PVE cluster rows showing hypervisors
+  nvram / load / disk / AI average, minimum, and maximum input/output tokens/sec, colored by threshold, plus PVE cluster rows showing hypervisors
   online and guests running. Station tabs then show *only* their own detail panels.
   Configure placement with `summary overview|all|off` in the config file.
 - **Right rail** — fleet-wide CPU / MEM / NVRAM / DISK bars, color-banded against
@@ -124,7 +124,7 @@ knobs, troubleshooting — is in the [setup guide](docs/SETUP.md).
   memory (DGX Spark's GB10, other SoC GPUs) still render fully: utilization + temperature
   plus unified-memory usage as the sum of CUDA process allocations over host RAM.
 - **AI SESSIONS** — every discovered inference-server listener on the station, with active
-  and queued requests plus input/output tokens/sec. Auto-detects **vLLM, SGLang, Hugging
+  and queued requests plus five-second average/minimum/maximum input and output tokens/sec. Auto-detects **vLLM, SGLang, Hugging
   Face TGI, TensorRT-LLM/Triton, Ollama, llama.cpp (`llama-server`), and LMDeploy**, including
   custom `--port`/`--host` arguments and multiple listeners. Containerized servers are followed
   through their published Docker/Podman ports. Rates come from each listener's loopback

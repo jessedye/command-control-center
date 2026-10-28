@@ -51,11 +51,24 @@ struct CounterPoint {
     generated: Option<f64>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct RateStats {
+    average: Option<f64>,
+    minimum: Option<f64>,
+    maximum: Option<f64>,
+}
+
+impl RateStats {
+    fn native(value: Option<f64>) -> Self {
+        Self { average: value, minimum: value, maximum: value }
+    }
+}
+
 #[derive(Default)]
 pub struct Baseline {
     history: HashMap<String, VecDeque<CounterPoint>>,
     missed_dt: HashMap<String, f64>,
-    last_rates: HashMap<String, (Option<f64>, Option<f64>)>,
+    last_rates: HashMap<String, (RateStats, RateStats)>,
 }
 
 impl Baseline {
@@ -85,22 +98,61 @@ impl Baseline {
         (elapsed > 0.0 && now >= old).then_some((now - old) / elapsed)
     }
 
+    fn window_stats(
+        &self,
+        key: &str,
+        dt: f64,
+        current: Option<f64>,
+        select: fn(&CounterPoint) -> Option<f64>,
+    ) -> RateStats {
+        let average = self.window_rate(key, dt, current, select);
+        let mut intervals = Vec::new();
+        if let (Some(now), Some(history)) = (current, self.history.get(key)) {
+            let dt = dt + self.missed_dt.get(key).copied().unwrap_or(0.0);
+            if let Some(old) = history.back().and_then(select) {
+                if dt > 0.0 && now >= old {
+                    intervals.push((now - old) / dt);
+                }
+            }
+            let mut covered = dt;
+            for index in (1..history.len()).rev() {
+                if covered >= RATE_WINDOW_SECS {
+                    break;
+                }
+                let newer = history[index];
+                let older = history[index - 1];
+                if let (Some(new), Some(old)) = (select(&newer), select(&older)) {
+                    if newer.dt > 0.0 && new >= old {
+                        intervals.push((new - old) / newer.dt);
+                    }
+                }
+                covered += newer.dt.max(0.0);
+            }
+        }
+        let minimum = intervals.iter().copied().reduce(f64::min);
+        let maximum = intervals.iter().copied().reduce(f64::max);
+        RateStats { average, minimum, maximum }
+    }
+
     pub fn rates(&self, dt_secs: f64, counters: &[Counter]) -> Vec<InferenceSession> {
         counters
             .iter()
             .map(|c| {
                 let key = counter_key(c);
-                let previous = self.last_rates.get(&key).copied().unwrap_or((None, None));
+                let previous = self.last_rates.get(&key).copied().unwrap_or_default();
                 let missed = self.missed_dt.get(&key).copied().unwrap_or(0.0) + dt_secs;
                 let prompt = match c.prompt_total {
-                    Some(_) => self.window_rate(&key, dt_secs, c.prompt_total, |p| p.prompt),
+                    Some(_) => self.window_stats(&key, dt_secs, c.prompt_total, |p| p.prompt),
                     None if missed <= RATE_WINDOW_SECS => previous.0,
-                    None => None,
+                    None => RateStats::default(),
                 };
                 let output = match c.generated_total {
-                    Some(_) => self.window_rate(&key, dt_secs, c.generated_total, |p| p.generated).or(c.native_tps),
-                    None if missed <= RATE_WINDOW_SECS => c.native_tps.or(previous.1),
-                    None => c.native_tps,
+                    Some(_) => {
+                        let stats = self.window_stats(&key, dt_secs, c.generated_total, |p| p.generated);
+                        if stats.average.is_some() { stats } else { RateStats::native(c.native_tps) }
+                    }
+                    None if missed <= RATE_WINDOW_SECS && c.native_tps.is_none() => previous.1,
+                    None => RateStats::native(c.native_tps),
                 };
                 InferenceSession {
                     harness: c.harness.clone(),
@@ -108,8 +160,12 @@ impl Baseline {
                     pid: c.pid,
                     active: c.active,
                     queued: c.queued,
-                    prompt_tps: prompt,
-                    output_tps: output,
+                    prompt_tps: prompt.average,
+                    prompt_min_tps: prompt.minimum,
+                    prompt_max_tps: prompt.maximum,
+                    output_tps: output.average,
+                    output_min_tps: output.minimum,
+                    output_max_tps: output.maximum,
                 }
             })
             .collect()
@@ -141,12 +197,12 @@ impl Baseline {
                 }
                 history.pop_front();
             }
-            let previous = self.last_rates.entry(key).or_insert((None, None));
+            let previous = self.last_rates.entry(key).or_default();
             if c.prompt_total.is_some() {
-                previous.0 = row.prompt_tps;
+                previous.0 = RateStats { average: row.prompt_tps, minimum: row.prompt_min_tps, maximum: row.prompt_max_tps };
             }
             if c.generated_total.is_some() || c.native_tps.is_some() {
-                previous.1 = row.output_tps;
+                previous.1 = RateStats { average: row.output_tps, minimum: row.output_min_tps, maximum: row.output_max_tps };
             }
         }
         let live: Vec<String> = counters.iter().map(counter_key).collect();
@@ -583,6 +639,8 @@ mod tests {
         baseline.commit(1.0, &[counter.clone()]);
         let idle = baseline.rates(1.0, &[counter.clone()]);
         assert_eq!(idle[0].output_tps, Some(50.0));
+        assert_eq!(idle[0].output_min_tps, Some(0.0));
+        assert_eq!(idle[0].output_max_tps, Some(100.0));
         baseline.commit(1.0, &[counter.clone()]);
         counter.prompt_total = None;
         counter.generated_total = None;
@@ -603,7 +661,10 @@ mod tests {
         baseline.commit(0.0, &[counter.clone()]);
         for _ in 0..12 {
             counter.generated_total = Some(counter.generated_total.unwrap() + 100.0);
-            assert_eq!(baseline.rates(2.0, &[counter.clone()])[0].output_tps, Some(50.0));
+            let rows = baseline.rates(2.0, &[counter.clone()]);
+            assert_eq!(rows[0].output_tps, Some(50.0));
+            assert_eq!(rows[0].output_min_tps, Some(50.0));
+            assert_eq!(rows[0].output_max_tps, Some(50.0));
             baseline.commit(2.0, &[counter.clone()]);
         }
     }

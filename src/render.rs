@@ -699,11 +699,11 @@ fn inference_panel(h: &Station, max_rows: usize) -> Vec<Row> {
         vec![
             seg("AI SESSIONS ", St::Head),
             seg(format!("· {} listener{}", h.inference.len(), if h.inference.len() == 1 { "" } else { "s" }), St::Dim),
-            seg("  (5s average, listener-wide)", St::Dim),
+            seg("  (5s avg/min/max, listener-wide)", St::Dim),
         ],
         vec![seg(format!(
-            "{:<14} {:<23} {:>7} {:>6} {:>6} {:>11} {:>11}",
-            "HARNESS", "ENDPOINT", "PID", "ACTIVE", "QUEUED", "IN TOK/S", "OUT TOK/S"
+            "{:<14} {:<23} {:>7} {:>6} {:>6} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+            "HARNESS", "ENDPOINT", "PID", "ACTIVE", "QUEUED", "IN AVG", "IN MIN", "IN MAX", "OUT AVG", "OUT MIN", "OUT MAX"
         ), St::Dim)],
     ];
     for session in h.inference.iter().take(max_rows) {
@@ -713,8 +713,12 @@ fn inference_panel(h: &Station, max_rows: usize) -> Vec<Row> {
             seg(format!("{:>7} ", session.pid), St::Dim),
             seg(format!("{:>6} ", number(session.active)), St::Normal),
             seg(format!("{:>6} ", number(session.queued)), St::Normal),
-            seg(format!("{:>11} ", rate(session.prompt_tps)), St::Normal),
-            seg(format!("{:>11}", rate(session.output_tps)), St::Ident),
+            seg(format!("{:>8} ", rate(session.prompt_tps)), St::Normal),
+            seg(format!("{:>8} ", rate(session.prompt_min_tps)), St::Dim),
+            seg(format!("{:>8} ", rate(session.prompt_max_tps)), St::Normal),
+            seg(format!("{:>8} ", rate(session.output_tps)), St::Ident),
+            seg(format!("{:>8} ", rate(session.output_min_tps)), St::Dim),
+            seg(format!("{:>8}", rate(session.output_max_tps)), St::Ident),
         ]);
     }
     rows
@@ -820,23 +824,26 @@ fn fleet_chips(view: &View, with_disk: bool) -> Vec<Row> {
                     // glance needs disk too, not just cpu/mem/nvram/load.
                     tail.push_str(&format!("  disk {:>4.0}%", disk_max_pct(h)));
                     if !h.inference.is_empty() {
-                        let (input, output, input_known, output_known) = h.inference.iter().fold(
-                            (0.0, 0.0, false, false),
-                            |(input, output, input_known, output_known), session| {
-                                (
-                                    input + session.prompt_tps.unwrap_or(0.0),
-                                    output + session.output_tps.unwrap_or(0.0),
-                                    input_known || session.prompt_tps.is_some(),
-                                    output_known || session.output_tps.is_some(),
-                                )
-                            },
-                        );
-                        let cell = |value: Option<f64>| {
-                            value.map(|rate| format!("{rate:.1}")).unwrap_or_else(|| "—".into())
+                        let (sums, known) = h.inference.iter().fold(([0.0; 6], [false; 6]), |(mut sums, mut known), session| {
+                            let values = [
+                                session.prompt_tps, session.prompt_min_tps, session.prompt_max_tps,
+                                session.output_tps, session.output_min_tps, session.output_max_tps,
+                            ];
+                            for (index, value) in values.into_iter().enumerate() {
+                                if let Some(value) = value {
+                                    sums[index] += value;
+                                    known[index] = true;
+                                }
+                            }
+                            (sums, known)
+                        });
+                        let cell = |index: usize| {
+                            if known[index] { format!("{:.1}", sums[index]) } else { "—".into() }
                         };
-                        let input = input_known.then_some(input);
-                        let output = output_known.then_some(output);
-                        tail.push_str(&format!("  ai {}/{} tok/s", cell(input), cell(output)));
+                        tail.push_str(&format!(
+                            "  ai avg {}/{}  min {}/{}  max {}/{} tok/s",
+                            cell(0), cell(3), cell(1), cell(4), cell(2), cell(5)
+                        ));
                     }
                 }
                 (l, tail)
@@ -1773,11 +1780,14 @@ mod fleet_render_tests {
             inference: vec![
                 InferenceSession {
                     harness: "vLLM".into(), endpoint: "127.0.0.1:8000".into(), pid: 42,
-                    active: Some(3.0), queued: Some(2.0), prompt_tps: Some(120.4), output_tps: Some(76.8),
+                    active: Some(3.0), queued: Some(2.0),
+                    prompt_tps: Some(120.4), prompt_min_tps: Some(0.0), prompt_max_tps: Some(200.0),
+                    output_tps: Some(76.8), output_min_tps: Some(10.0), output_max_tps: Some(90.0),
                 },
                 InferenceSession {
                     harness: "Ollama".into(), endpoint: "127.0.0.1:11434".into(), pid: 84,
-                    active: None, queued: None, prompt_tps: None, output_tps: None,
+                    active: None, queued: None, prompt_tps: None, prompt_min_tps: None, prompt_max_tps: None,
+                    output_tps: None, output_min_tps: None, output_max_tps: None,
                 },
             ],
             ..host_station()
@@ -1795,6 +1805,7 @@ mod fleet_render_tests {
 
         view.summary = crate::config::SummaryMode::Overview;
         view.focus = 0;
+        view.width = 170;
         view.stations = vec![
             UiStation {
                 label: OVERVIEW_LABEL.into(), host: None, err: None, pve: None, kube: None,
@@ -1807,7 +1818,7 @@ mod fleet_render_tests {
         ];
         let overview = to_plain(&build_rows(&view)).join("\n");
         let dgx = overview.lines().find(|line| line.contains("DGX1") && line.contains("cpu")).unwrap();
-        assert!(dgx.contains("ai 120.4/76.8 tok/s"), "{overview}");
+        assert!(dgx.contains("ai avg 120.4/76.8  min 0.0/10.0  max 200.0/90.0 tok/s"), "{overview}");
     }
 
     #[test]

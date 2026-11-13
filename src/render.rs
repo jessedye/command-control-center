@@ -737,7 +737,7 @@ fn rate_values(session: &crate::snapshot::InferenceSession) -> [Option<f64>; RAT
 
 fn rate_cells(values: [Option<f64>; RATE_COLUMNS], show: [bool; RATE_COLUMNS], scale: f64) -> Vec<Seg> {
     values.iter().zip(show).enumerate().map(|(index, (value, show))| {
-        let text = value.filter(|_| show).map(|v| format!("{:.1}", v / scale)).unwrap_or_else(|| "—".into());
+        let text = value.filter(|_| show).map(|v| rate_text(v / scale)).unwrap_or_else(|| "—".into());
         let style = match index {
             0 | 1 => St::Normal,
             7 => St::Dim,
@@ -746,6 +746,18 @@ fn rate_cells(values: [Option<f64>; RATE_COLUMNS], show: [bool; RATE_COLUMNS], s
         let sep = if index + 1 == RATE_COLUMNS { "" } else { " " };
         seg(format!("{text:>7}{sep}"), style)
     }).collect()
+}
+
+/// Fits the 7-character rate column: one decimal up to 99999.9, then `123.4k`, then `12.3M`, so a
+/// fleet prefill burst cannot push the columns to its right out of line.
+fn rate_text(value: f64) -> String {
+    if value < 99_999.95 {
+        format!("{value:.1}")
+    } else if value < 999_950.0 {
+        format!("{:.1}k", value / 1e3)
+    } else {
+        format!("{:.1}M", value / 1e6)
+    }
 }
 
 fn sum_rates<'a>(sessions: impl Iterator<Item = &'a crate::snapshot::InferenceSession>) -> ([Option<f64>; RATE_COLUMNS], [bool; RATE_COLUMNS]) {
@@ -1890,6 +1902,13 @@ mod fleet_render_tests {
             inference: Vec::new(),
             procs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn rate_text_keeps_the_column_width() {
+        assert_eq!(rate_text(99_999.9), "99999.9");
+        assert_eq!(rate_text(123_456.0), "123.5k");
+        assert!(rate_text(9_999_999.0).len() <= 7);
     }
 
     #[test]

@@ -306,7 +306,7 @@ impl LocalCollector {
                 .collect();
             self.net_base.commit(&c0);
             self.inference_base
-                .commit(&inference::sample(&inference_processes(&self.sys)));
+                .commit(0.0, &inference::sample(&inference_processes(&self.sys)));
             self.prev_at = Instant::now();
             self.primed = true;
             std::thread::sleep(std::time::Duration::from_millis(900));
@@ -338,7 +338,7 @@ impl LocalCollector {
 
         let inference_counters = inference::sample(&inference_processes(&self.sys));
         let inference = self.inference_base.rates(dt, &inference_counters);
-        self.inference_base.commit(&inference_counters);
+        self.inference_base.commit(dt, &inference_counters);
 
         let mem_total = self.sys.total_memory();
         // Skip kernel helper threads (argv-less, pegged at 0% by construction in practice):
@@ -712,7 +712,7 @@ impl RemoteCollector {
         // Commit the baseline only when the frame decoded (review fix #13): a corrupt frame
         // must not poison the next interval's counter baseline.
         self.net_base.commit(&counters);
-        self.inference_base.commit(&inference);
+        self.inference_base.commit(dt, &inference);
         self.prev_at = Instant::now();
         if station.name.trim().is_empty() {
             station.name = self.label.clone();

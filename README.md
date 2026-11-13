@@ -112,8 +112,10 @@ knobs, troubleshooting — is in the [setup guide](docs/SETUP.md).
 ## What's on screen
 
 - **Overview** (tab 1) — the consolidated fleet board: one row per station with cpu / mem /
-  nvram / load / disk, colored by threshold, plus PVE cluster rows showing hypervisors
-  online and guests running. Station tabs then show *only* their own detail panels.
+  nvram / load / disk / current AI output tokens/sec, colored by threshold, plus PVE cluster rows showing hypervisors
+  online and guests running. An aligned AI INFERENCE table adds active sessions, listeners,
+  queued requests, fleet totals, per-active-session live rates, and the token-rate columns
+  below per station. Station tabs then show *only* their own detail panels.
   Configure placement with `summary overview|all|off` in the config file.
 - **Right rail** — fleet-wide CPU / MEM / NVRAM / DISK bars, color-banded against
   `--warn` / `--crit`.
@@ -124,16 +126,33 @@ knobs, troubleshooting — is in the [setup guide](docs/SETUP.md).
   memory (DGX Spark's GB10, other SoC GPUs) still render fully: utilization + temperature
   plus unified-memory usage as the sum of CUDA process allocations over host RAM.
 - **AI SESSIONS** — every discovered inference-server listener on the station, with active
-  and queued requests plus input/output tokens/sec. Auto-detects **vLLM, SGLang, Hugging
+  and queued requests plus token rates over time. Auto-detects **vLLM, SGLang, Hugging
   Face TGI, TensorRT-LLM/Triton, Ollama, llama.cpp (`llama-server`), and LMDeploy**, including
   custom `--port`/`--host` arguments and multiple listeners. Containerized servers are followed
   through their published Docker/Podman ports. Rates come from each listener's loopback
-  `/metrics` counters over the real sample interval (or its native throughput gauge
-  when counters are unavailable). These are listener-wide totals, not separate client-request
+  `/metrics` counters over a rolling five-second window (or its native throughput gauge
+  when counters are unavailable). Brief scrape failures do not immediately reset the rate.
+  These are listener-wide totals, not separate client-request
   sessions. The first sample and harnesses that do not export a metric show `—`, never a fake
   zero. Remote discovery uses `python3`'s standard library when present; no package, agent,
   credentials, or remote file installation is needed, and other telemetry is unaffected when
   Python or metrics are unavailable.
+
+  | Column | Meaning |
+  |---|---|
+  | `IN 5S` / `OUT 5S` | input (prefill) / output tokens/sec over the last five seconds |
+  | `IN 5M` | input tokens/sec averaged over five minutes |
+  | `OUT 1M` / `OUT 5M` / `OUT 15M` | output tokens/sec averaged over 1, 5 and 15 minutes (over the history so far until the window fills) |
+  | `OUT AVG` | output tokens/sec since `ccc` started watching the listener, idle time included |
+  | `OUT MIN` / `OUT MAX` | slowest / fastest five-second output rate seen while the listener was continuously busy, since `ccc` started. Idle periods and windows that straddle idle time are skipped, so `MIN` shows real slow generation (for example decodes starved by a long prefill), not a meaningless zero |
+
+  History lives in the viewer, so it restarts when `ccc` restarts; a server restart (counters
+  falling) restarts the windows but keeps `OUT AVG`, `MIN` and `MAX`. On the Overview, `TOTAL`
+  sums the rates across stations but leaves `MIN`/`MAX` blank (different listeners' extremes
+  were not simultaneous), and `PER SESSION` divides only the live five-second rates by the
+  sessions active now. The station panel needs about 132 columns to show every rate column.
+  `MIN`/`MAX` trust only sample intervals up to 10 s (a longer one could hide idle time), so with
+  `--interval` of about 10 s or more they stay `—`.
 - **NET** — true interval deltas (bytes/sec) per interface, with link speed where known.
 - **DISK** — real mounts with fstype, usage bar, free/total.
 - **TOP PROCS** — union of the top processes by CPU *and* by memory, so a big idle

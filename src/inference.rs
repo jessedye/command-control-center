@@ -909,6 +909,29 @@ mod tests {
     }
 
     #[test]
+    fn a_short_missed_scrape_ends_the_busy_stretch() {
+        // 3 missed 1 s scrapes stay under the 10 s gap limit, so only the missed-path clear protects MIN
+        let mut baseline = Baseline::new();
+        let mut total = 0.0;
+        baseline.commit(0.0, &[vllm(total, 1.0)]);
+        for _ in 0..10 {
+            total += 50.0;
+            baseline.commit(1.0, &[vllm(total, 1.0)]);
+        }
+        let mut gone = vllm(0.0, 1.0);
+        gone.prompt_total = None;
+        gone.generated_total = None;
+        for _ in 0..3 {
+            baseline.commit(1.0, &[gone.clone()]);
+        }
+        for _ in 0..5 {
+            total += 5.0; // a stalled server: the gap and these windows are far below 50 tok/s
+            assert_eq!(baseline.rates(1.0, &[vllm(total, 1.0)])[0].output_min_tps, Some(50.0));
+            baseline.commit(1.0, &[vllm(total, 1.0)]);
+        }
+    }
+
+    #[test]
     fn without_an_active_gauge_the_tail_of_a_burst_is_not_busy() {
         let mut baseline = Baseline::new();
         let mut counter = vllm(0.0, 0.0);

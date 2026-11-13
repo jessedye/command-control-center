@@ -151,6 +151,8 @@ knobs, troubleshooting — is in the [setup guide](docs/SETUP.md).
   sums the rates across stations but leaves `MIN`/`MAX` blank (different listeners' extremes
   were not simultaneous), and `PER SESSION` divides only the live five-second rates by the
   sessions active now. The station panel needs about 132 columns to show every rate column.
+  `MIN`/`MAX` trust only sample intervals up to 10 s (a longer one could hide idle time), so with
+  `--interval` of about 10 s or more they stay `—`.
 - **NET** — true interval deltas (bytes/sec) per interface, with link speed where known.
 - **DISK** — real mounts with fstype, usage bar, free/total.
 - **TOP PROCS** — union of the top processes by CPU *and* by memory, so a big idle

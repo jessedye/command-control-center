@@ -694,34 +694,71 @@ fn inference_panel(h: &Station, max_rows: usize) -> Vec<Row> {
         return Vec::new();
     }
     let number = |value: Option<f64>| value.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into());
-    let rate = |value: Option<f64>| value.map(|v| format!("{v:.1}")).unwrap_or_else(|| "—".into());
     let mut rows = vec![
         vec![
             seg("AI SESSIONS ", St::Head),
             seg(format!("· {} listener{}", h.inference.len(), if h.inference.len() == 1 { "" } else { "s" }), St::Dim),
-            seg("  (5s avg/min/max, listener-wide)", St::Dim),
+            seg(format!("  ({RATE_LEGEND}, listener-wide)"), St::Dim),
         ],
-        vec![seg(format!(
-            "{:<14} {:<23} {:>7} {:>6} {:>6} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
-            "HARNESS", "ENDPOINT", "PID", "ACTIVE", "QUEUED", "IN AVG", "IN MIN", "IN MAX", "OUT AVG", "OUT MIN", "OUT MAX"
-        ), St::Dim)],
+        vec![seg(format!("{:<14} {:<23} {:>7} {:>6} {:>6} {}", "HARNESS", "ENDPOINT", "PID", "ACTIVE", "QUEUED", rate_header()), St::Dim)],
     ];
     for session in h.inference.iter().take(max_rows) {
-        rows.push(vec![
+        let mut row = vec![
             seg(format!("{:<14} ", trunc_cell(&session.harness, 14)), St::Normal),
             seg(format!("{:<23} ", trunc_cell(&session.endpoint, 23)), St::Dim),
             seg(format!("{:>7} ", session.pid), St::Dim),
             seg(format!("{:>6} ", number(session.active)), St::Normal),
             seg(format!("{:>6} ", number(session.queued)), St::Normal),
-            seg(format!("{:>8} ", rate(session.prompt_tps)), St::Normal),
-            seg(format!("{:>8} ", rate(session.prompt_min_tps)), St::Dim),
-            seg(format!("{:>8} ", rate(session.prompt_max_tps)), St::Normal),
-            seg(format!("{:>8} ", rate(session.output_tps)), St::Ident),
-            seg(format!("{:>8} ", rate(session.output_min_tps)), St::Dim),
-            seg(format!("{:>8}", rate(session.output_max_tps)), St::Ident),
-        ]);
+        ];
+        row.extend(rate_cells(rate_values(session), [true; RATE_COLUMNS], 1.0));
+        rows.push(row);
     }
     rows
+}
+
+/// Token-rate columns shared by the station panel and the overview table: input now and over 5 min,
+/// output now, over 1/5/15 min, since ccc started, and the slowest/fastest busy 5 s output rate.
+const RATE_COLUMNS: usize = 9;
+const RATE_LABELS: [&str; RATE_COLUMNS] =
+    ["IN 5S", "IN 5M", "OUT 5S", "OUT 1M", "OUT 5M", "OUT 15M", "OUT AVG", "OUT MIN", "OUT MAX"];
+const RATE_LEGEND: &str = "tok/s · AVG since ccc start · MIN/MAX of busy 5s windows";
+
+fn rate_header() -> String {
+    RATE_LABELS.iter().map(|label| format!("{label:>7}")).collect::<Vec<_>>().join(" ")
+}
+
+fn rate_values(session: &crate::snapshot::InferenceSession) -> [Option<f64>; RATE_COLUMNS] {
+    [
+        session.prompt_tps, session.prompt_5m_tps, session.output_tps,
+        session.output_1m_tps, session.output_5m_tps, session.output_15m_tps,
+        session.output_avg_tps, session.output_min_tps, session.output_max_tps,
+    ]
+}
+
+fn rate_cells(values: [Option<f64>; RATE_COLUMNS], show: [bool; RATE_COLUMNS], scale: f64) -> Vec<Seg> {
+    values.iter().zip(show).enumerate().map(|(index, (value, show))| {
+        let text = value.filter(|_| show).map(|v| format!("{:.1}", v / scale)).unwrap_or_else(|| "—".into());
+        let style = match index {
+            0 | 1 => St::Normal,
+            7 => St::Dim,
+            _ => St::Ident,
+        };
+        let sep = if index + 1 == RATE_COLUMNS { "" } else { " " };
+        seg(format!("{text:>7}{sep}"), style)
+    }).collect()
+}
+
+fn sum_rates<'a>(sessions: impl Iterator<Item = &'a crate::snapshot::InferenceSession>) -> ([Option<f64>; RATE_COLUMNS], [bool; RATE_COLUMNS]) {
+    let mut sums = [None; RATE_COLUMNS];
+    for session in sessions {
+        for (slot, value) in sums.iter_mut().zip(rate_values(session)) {
+            if let Some(value) = value {
+                *slot = Some(slot.unwrap_or(0.0) + value);
+            }
+        }
+    }
+    let known = sums.map(|value| value.is_some());
+    (sums, known)
 }
 
 fn net_panel(_view: &View, h: &Station, iface_cap: usize) -> Vec<Row> {
@@ -890,15 +927,12 @@ fn inference_overview(view: &View) -> Vec<Row> {
         vec![
             seg("AI INFERENCE ", St::Head),
             seg(format!(
-                "· {active_title} active session{} · {listeners} listener{} · 5s avg/min/max",
+                "· {active_title} active session{} · {listeners} listener{} · {RATE_LEGEND}",
                 if active == 1.0 { "" } else { "s" },
                 if listeners == 1 { "" } else { "s" }
             ), St::Dim),
         ],
-        vec![seg(format!(
-            "{:<14} {:<9} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
-            "STATION", "LISTENERS", "ACTIVE", "QUEUED", "IN AVG", "IN MIN", "IN MAX", "OUT AVG", "OUT MIN", "OUT MAX"
-        ), St::Dim)],
+        vec![seg(format!("{:<14} {:<9} {:>7} {:>7} {}", "STATION", "LISTENERS", "ACTIVE", "QUEUED", rate_header()), St::Dim)],
     ];
     for (label, host) in &stations {
         let gauge = |active: bool| host.inference.iter().fold((0.0, false), |(sum, known), session| {
@@ -908,84 +942,55 @@ fn inference_overview(view: &View) -> Vec<Row> {
         let (active, active_known) = gauge(true);
         let (queued, queued_known) = gauge(false);
         let integer = |value: f64, known: bool| if known { format!("{value:.0}") } else { "—".into() };
-        let (sums, known) = host.inference.iter().fold(([0.0; 6], [false; 6]), |(mut sums, mut known), session| {
-            let values = [
-                session.prompt_tps, session.prompt_min_tps, session.prompt_max_tps,
-                session.output_tps, session.output_min_tps, session.output_max_tps,
-            ];
-            for (index, value) in values.into_iter().enumerate() {
-                if let Some(value) = value {
-                    sums[index] += value;
-                    known[index] = true;
-                }
-            }
-            (sums, known)
-        });
-        let cell = |index: usize| if known[index] { format!("{:.1}", sums[index]) } else { "—".into() };
-        rows.push(vec![
+        let (sums, known) = sum_rates(host.inference.iter());
+        let mut row = vec![
             seg(format!("{:<14} ", trunc_cell(&label, 14)), St::Ident),
             seg(format!("{:<9} ", host.inference.len()), St::Dim),
             seg(format!("{:>7} ", integer(active, active_known)), St::Normal),
             seg(format!("{:>7} ", integer(queued, queued_known)), St::Normal),
-            seg(format!("{:>8} ", cell(0)), St::Normal),
-            seg(format!("{:>8} ", cell(1)), St::Dim),
-            seg(format!("{:>8} ", cell(2)), St::Normal),
-            seg(format!("{:>8} ", cell(3)), St::Ident),
-            seg(format!("{:>8} ", cell(4)), St::Dim),
-            seg(format!("{:>8}", cell(5)), St::Ident),
-        ]);
+        ];
+        row.extend(rate_cells(sums, known, 1.0));
+        rows.push(row);
     }
-    let (sums, known) = stations.iter().fold(([0.0; 6], [false; 6]), |(mut sums, mut known), (_, host)| {
-        for session in &host.inference {
-            let values = [
-                session.prompt_tps, session.prompt_min_tps, session.prompt_max_tps,
-                session.output_tps, session.output_min_tps, session.output_max_tps,
-            ];
-            for (index, value) in values.into_iter().enumerate() {
-                if let Some(value) = value {
-                    sums[index] += value;
-                    known[index] = true;
-                }
-            }
-        }
-        (sums, known)
-    });
+    let (sums, known) = sum_rates(stations.iter().flat_map(|(_, host)| host.inference.iter()));
     let (queued, queued_known) = stations.iter().fold((0.0, false), |(sum, known), (_, host)| {
         host.inference.iter().fold((sum, known), |(sum, known), session| {
             (sum + session.queued.unwrap_or(0.0), known || session.queued.is_some())
         })
     });
-    let summary_row = |label: &str, listeners: String, active: String, queued: String, values: [f64; 6], available: [bool; 6], scale: f64| {
-        let cell = |index: usize| if available[index] { format!("{:.1}", values[index] / scale) } else { "—".into() };
-        vec![
+    let summary_row = |label: &str, listeners: String, active: String, queued: String, show: [bool; RATE_COLUMNS], scale: f64| {
+        let mut row = vec![
             seg(format!("{label:<14} "), St::Ident),
             seg(format!("{listeners:<9} "), St::Dim),
             seg(format!("{active:>7} "), St::Normal),
             seg(format!("{queued:>7} "), St::Normal),
-            seg(format!("{:>8} ", cell(0)), St::Normal),
-            seg(format!("{:>8} ", cell(1)), St::Dim),
-            seg(format!("{:>8} ", cell(2)), St::Normal),
-            seg(format!("{:>8} ", cell(3)), St::Ident),
-            seg(format!("{:>8} ", cell(4)), St::Dim),
-            seg(format!("{:>8}", cell(5)), St::Ident),
-        ]
+        ];
+        row.extend(rate_cells(sums, show, scale));
+        row
     };
+    // Rates add across listeners, but the slowest/fastest 5 s windows of different listeners did not
+    // happen at the same moment, so a summed MIN/MAX would describe no real instant: TOTAL leaves them out.
+    let mut total_show = known;
+    total_show[7] = false;
+    total_show[8] = false;
     rows.push(summary_row(
         "TOTAL",
         listeners.to_string(),
         if active_known { format!("{active:.0}") } else { "—".into() },
         if queued_known { format!("{queued:.0}") } else { "—".into() },
-        sums,
-        known,
+        total_show,
         1.0,
     ));
+    // Only the live 5 s rates divide by the sessions active right now; a 15-minute average divided by
+    // the current session count would mix two different moments.
+    let per_session_show: [bool; RATE_COLUMNS] =
+        std::array::from_fn(|index| (index == 0 || index == 2) && known[index] && active_known && active > 0.0);
     rows.push(summary_row(
         "PER SESSION",
         "—".into(),
         "—".into(),
         "—".into(),
-        sums,
-        if active_known && active > 0.0 { known } else { [false; 6] },
+        per_session_show,
         if active > 0.0 { active } else { 1.0 },
     ));
     rows
@@ -1895,18 +1900,21 @@ mod fleet_render_tests {
                 InferenceSession {
                     harness: "vLLM".into(), endpoint: "127.0.0.1:8000".into(), pid: 42,
                     active: Some(3.0), queued: Some(2.0),
-                    prompt_tps: Some(120.4), prompt_min_tps: Some(0.0), prompt_max_tps: Some(200.0),
-                    output_tps: Some(76.8), output_min_tps: Some(10.0), output_max_tps: Some(90.0),
+                    prompt_tps: Some(120.4), prompt_5m_tps: Some(200.0),
+                    output_tps: Some(76.8), output_1m_tps: Some(61.5), output_5m_tps: Some(44.4),
+                    output_15m_tps: Some(33.3), output_avg_tps: Some(22.2),
+                    output_min_tps: Some(10.0), output_max_tps: Some(90.0),
                 },
                 InferenceSession {
                     harness: "Ollama".into(), endpoint: "127.0.0.1:11434".into(), pid: 84,
-                    active: None, queued: None, prompt_tps: None, prompt_min_tps: None, prompt_max_tps: None,
-                    output_tps: None, output_min_tps: None, output_max_tps: None,
+                    active: None, queued: None, prompt_tps: None, prompt_5m_tps: None, output_tps: None,
+                    output_1m_tps: None, output_5m_tps: None, output_15m_tps: None, output_avg_tps: None,
+                    output_min_tps: None, output_max_tps: None,
                 },
             ],
             ..host_station()
         };
-        let mut view = view_with_fleet(120, &[], &[], &[]);
+        let mut view = view_with_fleet(140, &[], &[], &[]);
         view.stations = vec![UiStation {
             label: "gpu".into(), host: Some(&host), err: None, pve: None, kube: None,
             kube_pods: &[], kube_pvcs: &[], kube_note: None, hist_cpu: Vec::new(), hist_mem: Vec::new(), sample_ts: 0,
@@ -1915,6 +1923,13 @@ mod fleet_render_tests {
         assert!(text.contains("AI SESSIONS · 2 listeners"), "{text}");
         assert!(text.contains("vLLM") && text.contains("127.0.0.1:8000"));
         assert!(text.contains("120.4") && text.contains("76.8"));
+        let panel_header = text.lines().find(|line| line.starts_with("HARNESS")).unwrap();
+        for label in ["IN 5S", "IN 5M", "OUT 5S", "OUT 1M", "OUT 5M", "OUT 15M", "OUT AVG", "OUT MIN", "OUT MAX"] {
+            assert!(panel_header.contains(label), "missing {label}: {panel_header}");
+        }
+        let vllm = text.lines().find(|line| line.starts_with("vLLM")).unwrap();
+        let cells: Vec<&str> = vllm.split_whitespace().rev().take(9).collect::<Vec<_>>().into_iter().rev().collect();
+        assert_eq!(cells, ["120.4", "200.0", "76.8", "61.5", "44.4", "33.3", "22.2", "10.0", "90.0"], "{vllm}");
         assert!(text.contains("Ollama") && text.contains("—"));
 
         view.summary = crate::config::SummaryMode::Overview;
@@ -1935,15 +1950,17 @@ mod fleet_render_tests {
         assert!(dgx.contains("ai 76.8 tok/s"), "{overview}");
         assert!(overview.contains("AI INFERENCE · 3 active sessions · 2 listeners"), "{overview}");
         let stats = overview.lines().find(|line| line.contains("DGX1") && line.contains("120.4")).unwrap();
-        for probe in ["2", "3", "2", "120.4", "0.0", "200.0", "76.8", "10.0", "90.0"] {
-            assert!(stats.contains(probe), "missing {probe}: {stats}");
-        }
+        let tail = |line: &str| -> Vec<String> {
+            let cells: Vec<String> = line.split_whitespace().map(String::from).collect();
+            cells[cells.len() - 9..].to_vec()
+        };
+        assert_eq!(tail(stats), ["120.4", "200.0", "76.8", "61.5", "44.4", "33.3", "22.2", "10.0", "90.0"], "{stats}");
+        // TOTAL sums the rates but leaves MIN/MAX out: different listeners' extremes were not simultaneous.
         let total = overview.lines().find(|line| line.starts_with("TOTAL")).unwrap();
-        assert!(total.contains("120.4") && total.contains("76.8"), "{total}");
+        assert_eq!(tail(total), ["120.4", "200.0", "76.8", "61.5", "44.4", "33.3", "22.2", "—", "—"], "{total}");
+        // PER SESSION divides only the live 5 s rates by the 3 sessions active now.
         let per_session = overview.lines().find(|line| line.starts_with("PER SESSION")).unwrap();
-        for probe in ["40.1", "66.7", "25.6", "3.3", "30.0"] {
-            assert!(per_session.contains(probe), "missing {probe}: {per_session}");
-        }
+        assert_eq!(tail(per_session), ["40.1", "—", "25.6", "—", "—", "—", "—", "—", "—"], "{per_session}");
     }
 
     #[test]

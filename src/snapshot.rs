@@ -90,10 +90,17 @@ pub struct InferenceSession {
     pub pid: u32,
     pub active: Option<f64>,
     pub queued: Option<f64>,
+    /// Input and output tokens/sec over the last 5 s (live), and the input 5-minute average.
     pub prompt_tps: Option<f64>,
-    pub prompt_min_tps: Option<f64>,
-    pub prompt_max_tps: Option<f64>,
+    pub prompt_5m_tps: Option<f64>,
     pub output_tps: Option<f64>,
+    /// Output tokens/sec averaged over 1, 5 and 15 minutes (over the available history until then).
+    pub output_1m_tps: Option<f64>,
+    pub output_5m_tps: Option<f64>,
+    pub output_15m_tps: Option<f64>,
+    /// Output tokens/sec since this viewer started watching the listener, idle time included.
+    pub output_avg_tps: Option<f64>,
+    /// Slowest and fastest 5 s output rate seen while the listener was continuously busy.
     pub output_min_tps: Option<f64>,
     pub output_max_tps: Option<f64>,
 }

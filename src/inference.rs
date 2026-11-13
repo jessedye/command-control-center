@@ -43,6 +43,11 @@ struct Metrics {
 }
 
 const RATE_WINDOW_SECS: f64 = 5.0;
+/// Longer averaging windows for output tokens/sec: 1, 5 and 15 minutes.
+const LONG_WINDOWS_SECS: [f64; 3] = [60.0, 300.0, 900.0];
+/// Input tokens/sec also gets a 5-minute average; prefill is too bursty to read from 5 s alone.
+const PROMPT_LONG_WINDOW_SECS: f64 = 300.0;
+const LONG_HISTORY_SECS: f64 = 900.0;
 
 #[derive(Clone, Copy)]
 struct CounterPoint {
@@ -51,24 +56,53 @@ struct CounterPoint {
     generated: Option<f64>,
 }
 
+#[derive(Clone, Copy)]
+struct LongPoint {
+    t: f64,
+    prompt: Option<f64>,
+    generated: Option<f64>,
+}
+
+/// Per-listener history since this viewer started watching it.
+#[derive(Default)]
+struct LongTerm {
+    points: VecDeque<LongPoint>,
+    clock: f64,
+    /// Output tokens and seconds covered by counted deltas (a counter reset contributes 0 tokens).
+    life_generated: f64,
+    life_secs: f64,
+    /// Seconds the listener has been continuously busy, so MIN/MAX only see 5 s windows that lie
+    /// entirely inside a busy stretch; a window straddling idle time would read low and pin the
+    /// minimum near zero, which says nothing about generation speed.
+    busy: bool,
+    busy_secs: f64,
+    out_min: Option<f64>,
+    out_max: Option<f64>,
+}
+
 #[derive(Clone, Copy, Default)]
-struct RateStats {
+struct LongRates {
+    prompt_5m: Option<f64>,
+    output: [Option<f64>; 3],
     average: Option<f64>,
     minimum: Option<f64>,
     maximum: Option<f64>,
-}
-
-impl RateStats {
-    fn native(value: Option<f64>) -> Self {
-        Self { average: value, minimum: value, maximum: value }
-    }
 }
 
 #[derive(Default)]
 pub struct Baseline {
     history: HashMap<String, VecDeque<CounterPoint>>,
     missed_dt: HashMap<String, f64>,
-    last_rates: HashMap<String, (RateStats, RateStats)>,
+    last_rates: HashMap<String, (Option<f64>, Option<f64>)>,
+    long: HashMap<String, LongTerm>,
+    last_long: HashMap<String, LongRates>,
+}
+
+fn is_busy(c: &Counter, output_5s: Option<f64>) -> bool {
+    match c.active {
+        Some(active) => active > 0.0,
+        None => output_5s.is_some_and(|rate| rate > 0.0),
+    }
 }
 
 impl Baseline {
@@ -98,40 +132,66 @@ impl Baseline {
         (elapsed > 0.0 && now >= old).then_some((now - old) / elapsed)
     }
 
-    fn window_stats(
-        &self,
-        key: &str,
-        dt: f64,
+    /// Average over `window` seconds ending now; until that much history exists, over what there is.
+    fn long_window(
+        term: &LongTerm,
+        now_t: f64,
+        window: f64,
         current: Option<f64>,
-        select: fn(&CounterPoint) -> Option<f64>,
-    ) -> RateStats {
-        let average = self.window_rate(key, dt, current, select);
-        let mut intervals = Vec::new();
-        if let (Some(now), Some(history)) = (current, self.history.get(key)) {
-            let dt = dt + self.missed_dt.get(key).copied().unwrap_or(0.0);
-            if let Some(old) = history.back().and_then(select) {
-                if dt > 0.0 && now >= old {
-                    intervals.push((now - old) / dt);
-                }
-            }
-            let mut covered = dt;
-            for index in (1..history.len()).rev() {
-                if covered >= RATE_WINDOW_SECS {
+        select: fn(&LongPoint) -> Option<f64>,
+    ) -> Option<f64> {
+        let now = current?;
+        // A counter below the newest sample means the server restarted; commit() clears the history.
+        if term.points.back().and_then(select).is_some_and(|newest| now < newest) {
+            return None;
+        }
+        let mut chosen = None;
+        for point in term.points.iter().rev() {
+            if let Some(value) = select(point) {
+                chosen = Some((point.t, value));
+                if now_t - point.t >= window {
                     break;
                 }
-                let newer = history[index];
-                let older = history[index - 1];
-                if let (Some(new), Some(old)) = (select(&newer), select(&older)) {
-                    if newer.dt > 0.0 && new >= old {
-                        intervals.push((new - old) / newer.dt);
-                    }
-                }
-                covered += newer.dt.max(0.0);
             }
         }
-        let minimum = intervals.iter().copied().reduce(f64::min);
-        let maximum = intervals.iter().copied().reduce(f64::max);
-        RateStats { average, minimum, maximum }
+        let (t, old) = chosen?;
+        let span = now_t - t;
+        (span > 0.0 && now >= old).then(|| (now - old) / span)
+    }
+
+    fn long_rates(&self, key: &str, dt_total: f64, c: &Counter, output_5s: Option<f64>) -> LongRates {
+        let Some(term) = self.long.get(key) else {
+            return LongRates::default();
+        };
+        let now_t = term.clock + dt_total;
+        let mut output = [None; 3];
+        for (slot, window) in output.iter_mut().zip(LONG_WINDOWS_SECS) {
+            *slot = Self::long_window(term, now_t, window, c.generated_total, |p| p.generated);
+        }
+        let prompt_5m = Self::long_window(term, now_t, PROMPT_LONG_WINDOW_SECS, c.prompt_total, |p| p.prompt);
+        let delta = match (c.generated_total, term.points.back().and_then(|p| p.generated)) {
+            (Some(now), Some(old)) => Some(if now >= old { now - old } else { 0.0 }),
+            _ => None,
+        };
+        let average = delta.and_then(|delta| {
+            let secs = term.life_secs + dt_total;
+            (secs > 0.0).then(|| (term.life_generated + delta) / secs)
+        });
+        let sample = (is_busy(c, output_5s)
+            && term.busy
+            && term.busy_secs + dt_total >= RATE_WINDOW_SECS)
+            .then_some(output_5s)
+            .flatten()
+            .filter(|rate| *rate > 0.0);
+        let minimum = match (term.out_min, sample) {
+            (Some(old), Some(new)) => Some(old.min(new)),
+            (old, new) => old.or(new),
+        };
+        let maximum = match (term.out_max, sample) {
+            (Some(old), Some(new)) => Some(old.max(new)),
+            (old, new) => old.or(new),
+        };
+        LongRates { prompt_5m, output, average: average.or(self.last_long.get(key).and_then(|r| r.average)), minimum, maximum }
     }
 
     pub fn rates(&self, dt_secs: f64, counters: &[Counter]) -> Vec<InferenceSession> {
@@ -142,17 +202,25 @@ impl Baseline {
                 let previous = self.last_rates.get(&key).copied().unwrap_or_default();
                 let missed = self.missed_dt.get(&key).copied().unwrap_or(0.0) + dt_secs;
                 let prompt = match c.prompt_total {
-                    Some(_) => self.window_stats(&key, dt_secs, c.prompt_total, |p| p.prompt),
+                    Some(_) => self.window_rate(&key, dt_secs, c.prompt_total, |p| p.prompt),
                     None if missed <= RATE_WINDOW_SECS => previous.0,
-                    None => RateStats::default(),
+                    None => None,
                 };
                 let output = match c.generated_total {
-                    Some(_) => {
-                        let stats = self.window_stats(&key, dt_secs, c.generated_total, |p| p.generated);
-                        if stats.average.is_some() { stats } else { RateStats::native(c.native_tps) }
-                    }
+                    Some(_) => self.window_rate(&key, dt_secs, c.generated_total, |p| p.generated).or(c.native_tps),
                     None if missed <= RATE_WINDOW_SECS && c.native_tps.is_none() => previous.1,
-                    None => RateStats::native(c.native_tps),
+                    None => c.native_tps,
+                };
+                let long = if c.prompt_total.is_some() || c.generated_total.is_some() {
+                    self.long_rates(&key, missed, c, output)
+                } else {
+                    // A missed scrape keeps the long-run figures; the windowed ones only while still fresh.
+                    let mut kept = self.last_long.get(&key).copied().unwrap_or_default();
+                    if missed > RATE_WINDOW_SECS {
+                        kept.prompt_5m = None;
+                        kept.output = [None; 3];
+                    }
+                    kept
                 };
                 InferenceSession {
                     harness: c.harness.clone(),
@@ -160,12 +228,15 @@ impl Baseline {
                     pid: c.pid,
                     active: c.active,
                     queued: c.queued,
-                    prompt_tps: prompt.average,
-                    prompt_min_tps: prompt.minimum,
-                    prompt_max_tps: prompt.maximum,
-                    output_tps: output.average,
-                    output_min_tps: output.minimum,
-                    output_max_tps: output.maximum,
+                    prompt_tps: prompt,
+                    prompt_5m_tps: long.prompt_5m,
+                    output_tps: output,
+                    output_1m_tps: long.output[0],
+                    output_5m_tps: long.output[1],
+                    output_15m_tps: long.output[2],
+                    output_avg_tps: long.average,
+                    output_min_tps: long.minimum,
+                    output_max_tps: long.maximum,
                 }
             })
             .collect()
@@ -176,7 +247,10 @@ impl Baseline {
         for (c, row) in counters.iter().zip(rates) {
             let key = counter_key(c);
             if c.prompt_total.is_none() && c.generated_total.is_none() {
-                *self.missed_dt.entry(key).or_insert(0.0) += dt_secs.max(0.0);
+                *self.missed_dt.entry(key.clone()).or_insert(0.0) += dt_secs.max(0.0);
+                if c.native_tps.is_some() {
+                    self.last_rates.entry(key).or_default().1 = row.output_tps;
+                }
                 continue;
             }
             let dt = dt_secs.max(0.0) + self.missed_dt.remove(&key).unwrap_or(0.0);
@@ -197,18 +271,47 @@ impl Baseline {
                 }
                 history.pop_front();
             }
+
+            let term = self.long.entry(key.clone()).or_default();
+            let now_t = term.clock + dt;
+            if reset {
+                term.points.clear();
+            } else if let (Some(now), Some(old)) = (c.generated_total, term.points.back().and_then(|p| p.generated)) {
+                term.life_generated += now - old;
+                term.life_secs += dt;
+            }
+            term.clock = now_t;
+            term.points.push_back(LongPoint { t: now_t, prompt: c.prompt_total, generated: c.generated_total });
+            while term.points.len() > 1 && now_t - term.points[1].t >= LONG_HISTORY_SECS {
+                term.points.pop_front();
+            }
+            let busy = is_busy(c, row.output_tps);
+            term.busy_secs = if busy && term.busy { term.busy_secs + dt } else { 0.0 };
+            term.busy = busy;
+            term.out_min = row.output_min_tps;
+            term.out_max = row.output_max_tps;
+            self.last_long.insert(key.clone(), LongRates {
+                prompt_5m: row.prompt_5m_tps,
+                output: [row.output_1m_tps, row.output_5m_tps, row.output_15m_tps],
+                average: row.output_avg_tps,
+                minimum: row.output_min_tps,
+                maximum: row.output_max_tps,
+            });
+
             let previous = self.last_rates.entry(key).or_default();
             if c.prompt_total.is_some() {
-                previous.0 = RateStats { average: row.prompt_tps, minimum: row.prompt_min_tps, maximum: row.prompt_max_tps };
+                previous.0 = row.prompt_tps;
             }
             if c.generated_total.is_some() || c.native_tps.is_some() {
-                previous.1 = RateStats { average: row.output_tps, minimum: row.output_min_tps, maximum: row.output_max_tps };
+                previous.1 = row.output_tps;
             }
         }
         let live: Vec<String> = counters.iter().map(counter_key).collect();
         self.history.retain(|key, _| live.contains(key));
         self.missed_dt.retain(|key, _| live.contains(key));
         self.last_rates.retain(|key, _| live.contains(key));
+        self.long.retain(|key, _| live.contains(key));
+        self.last_long.retain(|key, _| live.contains(key));
     }
 }
 
@@ -639,8 +742,6 @@ mod tests {
         baseline.commit(1.0, &[counter.clone()]);
         let idle = baseline.rates(1.0, &[counter.clone()]);
         assert_eq!(idle[0].output_tps, Some(50.0));
-        assert_eq!(idle[0].output_min_tps, Some(0.0));
-        assert_eq!(idle[0].output_max_tps, Some(100.0));
         baseline.commit(1.0, &[counter.clone()]);
         counter.prompt_total = None;
         counter.generated_total = None;
@@ -651,6 +752,77 @@ mod tests {
         assert_eq!(baseline.rates(1.0, &[counter])[0].output_tps, Some(25.0));
     }
 
+    fn vllm(generated: f64, active: f64) -> Counter {
+        Counter {
+            harness: "vLLM".into(), endpoint: "127.0.0.1:8000".into(), connect_host: "127.0.0.1".into(),
+            pid: 1, active: Some(active), queued: None, prompt_total: Some(0.0), generated_total: Some(generated),
+            native_tps: None,
+        }
+    }
+
+    #[test]
+    fn long_windows_and_lifetime_average_track_a_rate_change() {
+        // 100 tok/s for 15 minutes, then 20 tok/s for 5 minutes, sampled every second.
+        let mut baseline = Baseline::new();
+        let mut total = 0.0;
+        baseline.commit(0.0, &[vllm(total, 1.0)]);
+        for second in 0..1200 {
+            total += if second < 900 { 100.0 } else { 20.0 };
+            let counter = vllm(total, 1.0);
+            if second == 1199 {
+                let row = &baseline.rates(1.0, &[counter.clone()])[0];
+                let close = |value: Option<f64>, want: f64| (value.unwrap() - want).abs() < 0.01;
+                assert!(close(row.output_tps, 20.0), "{:?}", row.output_tps);
+                assert!(close(row.output_1m_tps, 20.0), "{:?}", row.output_1m_tps);
+                assert!(close(row.output_5m_tps, 20.0), "{:?}", row.output_5m_tps);
+                // 15 min = 10 min at 100 + 5 min at 20
+                assert!(close(row.output_15m_tps, (600.0 * 100.0 + 300.0 * 20.0) / 900.0), "{:?}", row.output_15m_tps);
+                assert!(close(row.output_avg_tps, (900.0 * 100.0 + 300.0 * 20.0) / 1200.0), "{:?}", row.output_avg_tps);
+                assert!(close(row.output_min_tps, 20.0) && close(row.output_max_tps, 100.0));
+            }
+            baseline.commit(1.0, &[counter]);
+        }
+    }
+
+    #[test]
+    fn min_and_max_ignore_idle_and_edge_windows() {
+        let mut baseline = Baseline::new();
+        let mut total = 0.0;
+        baseline.commit(0.0, &[vllm(total, 0.0)]);
+        // idle 30 s, then a 10 s burst at 60 tok/s, then idle again
+        for second in 0..60 {
+            let busy = (30..40).contains(&second);
+            if busy {
+                total += 60.0;
+            }
+            baseline.commit(1.0, &[vllm(total, if busy { 1.0 } else { 0.0 })]);
+        }
+        let row = &baseline.rates(1.0, &[vllm(total, 0.0)])[0];
+        assert_eq!(row.output_min_tps, Some(60.0), "a window straddling idle time must not count");
+        assert_eq!(row.output_max_tps, Some(60.0));
+        assert_eq!(row.output_tps, Some(0.0));
+        let avg = row.output_avg_tps.unwrap();
+        assert!((avg - 600.0 / 61.0).abs() < 0.01, "lifetime average includes idle time: {avg}");
+    }
+
+    #[test]
+    fn counter_reset_keeps_lifetime_figures_and_restarts_windows() {
+        let mut baseline = Baseline::new();
+        baseline.commit(0.0, &[vllm(0.0, 1.0)]);
+        for second in 1..=10 {
+            baseline.commit(1.0, &[vllm(50.0 * second as f64, 1.0)]);
+        }
+        // the server restarted: counters fall back to zero
+        let row = &baseline.rates(1.0, &[vllm(5.0, 1.0)])[0];
+        assert_eq!(row.output_tps, None);
+        assert_eq!(row.output_5m_tps, None);
+        assert!((row.output_avg_tps.unwrap() - 500.0 / 11.0).abs() < 0.01, "{:?}", row.output_avg_tps);
+        assert_eq!(row.output_max_tps, Some(50.0));
+        baseline.commit(1.0, &[vllm(5.0, 1.0)]);
+        let row = &baseline.rates(1.0, &[vllm(45.0, 1.0)])[0];
+        assert_eq!(row.output_1m_tps, Some(40.0));
+    }
+
     #[test]
     fn rolling_rate_is_independent_of_sample_interval() {
         let mut baseline = Baseline::new();
@@ -659,12 +831,16 @@ mod tests {
             pid: 1, active: Some(1.0), queued: None, prompt_total: Some(0.0), generated_total: Some(0.0), native_tps: None,
         };
         baseline.commit(0.0, &[counter.clone()]);
-        for _ in 0..12 {
+        for tick in 0..12 {
             counter.generated_total = Some(counter.generated_total.unwrap() + 100.0);
             let rows = baseline.rates(2.0, &[counter.clone()]);
             assert_eq!(rows[0].output_tps, Some(50.0));
-            assert_eq!(rows[0].output_min_tps, Some(50.0));
-            assert_eq!(rows[0].output_max_tps, Some(50.0));
+            for long in [rows[0].output_1m_tps, rows[0].output_5m_tps, rows[0].output_15m_tps, rows[0].output_avg_tps] {
+                assert_eq!(long, Some(50.0), "tick {tick}");
+            }
+            // MIN/MAX wait until a whole 5 s window lies inside the busy stretch (third 2 s tick).
+            let expected = if tick < 2 { None } else { Some(50.0) };
+            assert_eq!((rows[0].output_min_tps, rows[0].output_max_tps), (expected, expected), "tick {tick}");
             baseline.commit(2.0, &[counter.clone()]);
         }
     }
